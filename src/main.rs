@@ -111,9 +111,8 @@ fn main() {
 
     match cmd {
         "--help" => {
-            println!("Pitruck Compiler v0.1");
+            println!("Pitruck Compiler v1.0");
             println!("Usage: pitruck [command] [args]");
-            println!("");
             println!("Commands:");
             println!("  [file.pr]                  Run a pitruck source file");
             println!("  [file.pr] --speed          Run and show execution speed telemetry");
