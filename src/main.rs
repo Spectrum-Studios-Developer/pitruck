@@ -54,6 +54,69 @@ fn run_source(source: &str, show_perf: bool) -> bool {
 
     ok
 }
+fn serve_request(
+    source: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &str,
+    _headers: &[String],
+) -> (u16, String) {
+    let preamble = format!(
+        r#"
+class __Request {{
+    func init(method, path, query, body) {{
+        self.method = method
+        self.path   = path
+        self.query  = query
+        self.body   = body
+    }}
+}}
+var request = __Request({method_lit}, {path_lit}, {query_lit}, {body_lit})
+var response_status = 200
+var response_body   = ""
+"#,
+        method_lit = escape_pitruck_str(method),
+        path_lit   = escape_pitruck_str(path),
+        query_lit  = escape_pitruck_str(query),
+        body_lit   = escape_pitruck_str(body),
+    );
+
+    let full_source = format!("{}\n{}", preamble, source);
+
+    let mut lex = Lexer::new(&full_source);
+    let tokens = match lex.tokenize() {
+        Ok(t)  => t,
+        Err(e) => {
+            eprintln!("[serve] lex error: {e}");
+            return (500, format!("<pre>Lex error:\n{e}</pre>"));
+        }
+    };
+    let mut par = Parser::new(tokens);
+    let program = match par.parse_program() {
+        Ok(p)  => p,
+        Err(e) => {
+            eprintln!("[serve] parse error: {e}");
+            return (500, format!("<pre>Parse error:\n{e}</pre>"));
+        }
+    };
+
+    let mut vm = Interpreter::new();
+    if let Err(e) = vm.run(&program) {
+        eprintln!("[serve] runtime error: {e}");
+        return (500, format!("<pre>Runtime error:\n{e}</pre>"));
+    }
+
+    let status = vm.read_number("response_status").unwrap_or(200.0) as u16;
+    let html   = vm.read_string("response_body").unwrap_or_default();
+
+    (status, html)
+}
+
+fn escape_pitruck_str(s: &str) -> String {
+    let inner = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", inner)
+}
 
 fn repl() {
     let stdin  = io::stdin();
@@ -111,55 +174,121 @@ fn main() {
 
     match cmd {
         "--help" => {
-            println!("Pitruck Compiler v1.0");
+            println!("Pitruck Compiler v1.1");
             println!("Usage: pitruck [command] [args]");
             println!("Commands:");
             println!("  [file.pr]                  Run a pitruck source file");
             println!("  [file.pr] --speed          Run and show execution speed telemetry");
+            println!("  --serve <file.pr> [port]   Run file.pr as an HTTP request handler (default port 8000)");
             println!("  lib install <path/url>     Install a library locally or from a URL");
             println!("  lib list                   List installed libraries");
             println!("  lib delete <library>       Delete a library");
-            println!("  serve <port>               Run a local web server for your masterpieces");
             println!("  --help                     Show this help message");
             return;
         }
-        "serve" => {
-            let port = args.get(2).map(|s| s.as_str()).unwrap_or("8000");
+
+        "--serve" => {
+            if args.len() < 3 {
+                eprintln!("Usage: pitruck --serve <file.pr> [port]");
+                std::process::exit(1);
+            }
+            let script_path = &args[2];
+            let port = args.get(3).map(|s| s.as_str()).unwrap_or("8000");
             let addr = format!("0.0.0.0:{}", port);
+
+            let source = match fs::read_to_string(script_path) {
+                Ok(s)  => s,
+                Err(e) => {
+                    eprintln!("Cannot read '{}': {}", script_path, e);
+                    std::process::exit(1);
+                }
+            };
+
             let listener = match std::net::TcpListener::bind(&addr) {
-                Ok(l) => l,
+                Ok(l)  => l,
                 Err(e) => {
                     eprintln!("Could not bind to {}: {}", addr, e);
                     std::process::exit(1);
                 }
             };
-            println!("Pitruck Server running at http://{}", addr);
+            println!("Pitruck Server  →  http://localhost:{}", port);
+            println!("Handler         →  {}", script_path);
+
             for stream in listener.incoming() {
                 if let Ok(mut stream) = stream {
-                    let mut buffer = [0; 1024];
-                    if stream.read(&mut buffer).is_ok() {
-                        let request = String::from_utf8_lossy(&buffer);
-                        let path = request.split_whitespace().nth(1).unwrap_or("/");
-                        let file_path = if path == "/" { "index.html" } else { &path[1..] };
-                        
-                        let (status, content, content_type) = match fs::read(file_path) {
-                            Ok(c) => {
-                                let ctype = if file_path.ends_with(".css") { "text/css" } else { "text/html; charset=utf-8" };
-                                ("HTTP/1.1 200 OK", c, ctype)
-                            }
-                            Err(_) => ("HTTP/1.1 404 NOT FOUND", b"404 - Masterpiece Not Found".to_vec(), "text/plain"),
-                        };
-                        
-                        let response = format!("{}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", status, content_type, content.len());
-                        stream.write_all(response.as_bytes()).ok();
-                        stream.write_all(&content).ok();
-                        stream.flush().ok();
+                    let mut buffer = [0u8; 8192];
+                    let n = stream.read(&mut buffer).unwrap_or(0);
+                    let raw = String::from_utf8_lossy(&buffer[..n]);
 
+                    let mut raw_lines = raw.lines();
+                    let request_line = raw_lines.next().unwrap_or("GET / HTTP/1.1");
+                    let mut parts  = request_line.split_whitespace();
+                    let method     = parts.next().unwrap_or("GET").to_string();
+                    let full_path  = parts.next().unwrap_or("/").to_string();
+
+                    let (route, query) = match full_path.splitn(2, '?').collect::<Vec<_>>().as_slice() {
+                        [p, qs] => (p.to_string(), qs.to_string()),
+                        [p]     => (p.to_string(), String::new()),
+                        _       => (full_path.clone(), String::new()),
+                    };
+
+                    let mut headers: Vec<String> = Vec::new();
+                    for hl in raw_lines.by_ref() {
+                        if hl.is_empty() { break; }
+                        headers.push(hl.to_string());
                     }
+
+                    let body: String = raw_lines
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .trim_matches('\0')
+                        .to_string();
+
+                    let now = Instant::now();
+                    let (status_code, html) = serve_request(
+                        &source, &method, &route, &query, &body, &headers,
+                    );
+                    let elapsed_ms = now.elapsed().as_secs_f64() * 1000.0;
+
+                    let status_text = match status_code {
+                        200 => "OK",
+                        301 => "Moved Permanently",
+                        302 => "Found",
+                        400 => "Bad Request",
+                        403 => "Forbidden",
+                        404 => "Not Found",
+                        500 => "Internal Server Error",
+                        _   => "OK",
+                    };
+
+                    let content_type =
+                        if html.trim_start().starts_with("<!DOCTYPE")
+                            || html.trim_start().starts_with('<')
+                        {
+                            "text/html; charset=utf-8"
+                        } else {
+                            "text/plain; charset=utf-8"
+                        };
+
+                    let response = format!(
+                        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status_code, status_text, content_type, html.len(), html
+                    );
+
+                    stream.write_all(response.as_bytes()).ok();
+                    stream.flush().ok();
+
+                    // access log
+                    let snippet: String = html.chars().take(60).collect();
+                    println!(
+                        "[{}] {} {} ({:.1}ms) → {}…",
+                        status_code, method, route, elapsed_ms, snippet
+                    );
                 }
             }
             return;
         }
+
         "lib" => {
             if args.len() < 3 {
                 eprintln!("Usage: pitruck lib [install|list|delete]");
@@ -180,10 +309,10 @@ fn main() {
                     } else {
                         source.as_str()
                     };
-                    
+
                     fs::create_dir_all("lib").unwrap_or_default();
                     let dest = format!("lib/{}.pr", lib_name);
-                    
+
                     if source.starts_with("http") {
                         println!("Downloading '{}'...", source);
                         let status = std::process::Command::new("curl")
@@ -216,9 +345,7 @@ fn main() {
                                 }
                             }
                         }
-                        if !found {
-                            println!("  (none)");
-                        }
+                        if !found { println!("  (none)"); }
                     } else {
                         println!("  (none)");
                     }

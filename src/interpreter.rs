@@ -37,6 +37,26 @@ impl Interpreter {
         }
     }
 
+
+    pub fn read_number(&self, name: &str) -> Option<f64> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(Value::Number(n)) = scope.get(name) {
+                return Some(*n);
+            }
+        }
+        None
+    }
+    pub fn read_string(&self, name: &str) -> Option<String> {
+        for scope in self.scopes.iter().rev() {
+            match scope.get(name) {
+                Some(Value::Str(s))  => return Some(s.clone()),
+                Some(other)          => return Some(format!("{}", other)),
+                None                 => {}
+            }
+        }
+        None
+    }
+
     #[inline]
     fn next_rand(&mut self) -> u64 {
         self.rand_seed ^= self.rand_seed << 13;
@@ -208,7 +228,6 @@ impl Interpreter {
     }
 
     fn assign(&mut self, name: &str, val: Value, line: usize) -> Result<(), PitruckError> {
-        // Single-pass: find the slot and write directly, no double-lookup
         for scope in self.scopes.iter_mut().rev() {
             if let Some(slot) = scope.get_mut(name) {
                 *slot = val;
@@ -241,7 +260,6 @@ impl Interpreter {
         match stmt {
             Stmt::VarDecl { name, value, line } => {
                 let v = self.eval_expr(value)?;
-                // entry() API: single lookup instead of contains_key + insert
                 match self.scopes.last_mut().unwrap().entry(name.to_string()) {
                     Entry::Occupied(_) => {
                         return Err(PitruckError::RuntimeError {
@@ -299,7 +317,6 @@ impl Interpreter {
                 }
             }
             Stmt::Bring { module, line } => {
-                // Skip re-loading already-imported modules (avoids disk I/O + re-parsing)
                 if self.loaded_modules.contains(module) {
                     return Ok(Signal::None);
                 }
@@ -395,8 +412,6 @@ impl Interpreter {
         }
     }
 
-    /// Execute a block in a fresh scope, returning early on Signal::Return.
-    /// Extracted to remove copy-pasted push/pop/iterate code from every branch.
     #[inline]
     fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Signal, PitruckError> {
         self.push_scope();
@@ -446,13 +461,11 @@ impl Interpreter {
 
             Expr::Get { object, name, line } => {
                 let obj = self.eval_expr(object)?;
-                // Match by ref first to avoid cloning the entire instance up front
                 if let Value::Instance { fields, methods, .. } = &obj {
                     if let Some(val) = fields.borrow().get(name) {
                         return Ok(val.clone());
                     }
                     if let Some(method) = methods.get(name) {
-                        // Only clone the method Value (a Function), not the whole methods map
                         return Ok(Value::BoundMethod {
                             receiver: Box::new(obj.clone()),
                             method: Box::new(method.clone()),
@@ -503,7 +516,6 @@ impl Interpreter {
             }
 
             Expr::BinOp { op, left, right, line } => {
-                // Short-circuit ops: evaluate right only if needed
                 if matches!(op, BinOpKind::And) {
                     let l = self.eval_expr(left)?;
                     return if !l.is_truthy() { Ok(l) } else { self.eval_expr(right) };
@@ -523,7 +535,6 @@ impl Interpreter {
                     evaluated_args.push(self.eval_expr(a)?);
                 }
 
-                // Fast path: named builtins — no heap allocation for callee lookup
                 if let Expr::Ident { name, .. } = &**callee {
                     if let Some(result) = self.call_builtin(name, &evaluated_args, *line) {
                         return result;
@@ -650,7 +661,6 @@ impl Interpreter {
             BinOpKind::Gt    => self.compare_nums(l, r, line, |a, b| a > b),
             BinOpKind::LtEq  => self.compare_nums(l, r, line, |a, b| a <= b),
             BinOpKind::GtEq  => self.compare_nums(l, r, line, |a, b| a >= b),
-            // And/Or are short-circuited in eval_expr and never reach here
             BinOpKind::And | BinOpKind::Or => unreachable!("And/Or handled in eval_expr"),
         }
     }
