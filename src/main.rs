@@ -119,17 +119,13 @@ fn main() {
             println!("  lib install <path/url>     Install a library locally or from a URL");
             println!("  lib list                   List installed libraries");
             println!("  lib delete <library>       Delete a library");
-            println!("  update --all               Update all libraries");
-            println!("  update <library>           Update a specific library");
-            println!("  upgrade                    Upgrade pitruck to the latest version via cargo");
-            println!("  doctor                     Fix pitruck environment issues");
             println!("  serve <port>               Run a local web server for your masterpieces");
             println!("  --help                     Show this help message");
             return;
         }
         "serve" => {
             let port = args.get(2).map(|s| s.as_str()).unwrap_or("8000");
-            let addr = format!("127.0.0.1:{}", port);
+            let addr = format!("0.0.0.0:{}", port);
             let listener = match std::net::TcpListener::bind(&addr) {
                 Ok(l) => l,
                 Err(e) => {
@@ -244,75 +240,6 @@ fn main() {
                     eprintln!("Unknown lib command '{}'", subcmd);
                     std::process::exit(1);
                 }
-            }
-            return;
-        }
-        "update" => {
-            if args.len() < 3 {
-                eprintln!("Usage: pitruck update <library> | pitruck update --all");
-                std::process::exit(1);
-            }
-            if args[2] == "--all" {
-                println!("Updating all libraries... (Requires configured package registry)");
-            } else {
-                println!("Updating library '{}'... (Requires configured package registry)", args[2]);
-            }
-            return;
-        }
-        "upgrade" => {
-            println!("Upgrading Pitruck...");
-            if std::path::Path::new("Cargo.toml").exists() {
-                println!("Found Cargo workspace. Running 'cargo build --release'...");
-                let status = std::process::Command::new("cargo")
-                    .args(["build", "--release"])
-                    .status();
-                if status.map_or(false, |s| s.success()) {
-                    println!("Upgrade complete! New binary available in target/release/");
-                } else {
-                    println!("Failed to upgrade via cargo.");
-                }
-            } else {
-                println!("No Cargo.toml found. Please download the latest binary manually.");
-            }
-            return;
-        }
-        "doctor" => {
-            println!("Running Pitruck Doctor...");
-            let mut issues = 0;
-            if !std::path::Path::new("lib").exists() {
-                println!("[-] 'lib' directory is missing. Creating...");
-                fs::create_dir_all("lib").unwrap_or_default();
-                issues += 1;
-            } else {
-                println!("[+] 'lib' directory exists.");
-            }
-            
-            let stdlibs = ["system", "time", "color", "math"];
-            for lib in stdlibs {
-                let path = format!("lib/{}.pr", lib);
-                if !std::path::Path::new(&path).exists() {
-                    println!("[-] Standard library '{}' is missing. Recreating stub...", lib);
-                    fs::write(&path, format!("Recovered {} library\n", lib)).unwrap_or_default();
-                    issues += 1;
-                } else {
-                    let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    if size == 0 {
-                        println!("[-] Standard library '{}' is empty. Recreating stub...", lib);
-                        fs::write(&path, format!("Recovered {} library\n", lib)).unwrap_or_default();
-                        issues += 1;
-                    } else {
-                        println!("[+] Standard library '{}' is healthy ({} bytes).", lib, size);
-                    }
-                }
-            }
-            
-            println!("[+] Rust Cargo available: {}", std::process::Command::new("cargo").arg("--version").status().is_ok());
-            println!("[+] Curl available: {}", std::process::Command::new("curl").arg("--version").status().is_ok());
-            
-            if issues == 0 {
-                println!("Doctor summary: Everything is perfectly healthy!");
-            } else {
-                println!("Doctor summary: Fixed {} issues.", issues);
             }
             return;
         }

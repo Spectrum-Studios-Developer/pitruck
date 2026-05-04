@@ -1,8 +1,9 @@
 use crate::ast::*;
 use crate::value::Value;
 use crate::error::PitruckError;
-use std::collections::HashMap;
-use std::io::{self, Write, Read, BufRead};
+use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::io::{self, Write, BufRead};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -15,15 +16,16 @@ pub enum Signal {
 
 pub struct Interpreter {
     scopes: Vec<HashMap<String, Value>>,
-    start:  Instant,
+    start: Instant,
     rand_seed: u64,
+    loaded_modules: HashSet<String>,
 }
 
 impl Interpreter {
     pub fn new() -> Self {
         let mut globals = HashMap::new();
-        globals.insert("PI".to_string(), Value::Number(3.141592653589793));
-        globals.insert("E".to_string(), Value::Number(2.718281828459045));
+        globals.insert("PI".to_string(), Value::Number(std::f64::consts::PI));
+        globals.insert("E".to_string(), Value::Number(std::f64::consts::E));
         Interpreter {
             scopes: vec![globals],
             start: Instant::now(),
@@ -31,9 +33,11 @@ impl Interpreter {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
+            loaded_modules: HashSet::new(),
         }
     }
 
+    #[inline]
     fn next_rand(&mut self) -> u64 {
         self.rand_seed ^= self.rand_seed << 13;
         self.rand_seed ^= self.rand_seed >> 17;
@@ -55,7 +59,8 @@ impl Interpreter {
                     _ => return Some(Err(PitruckError::RuntimeError { line, message: "rand requires numbers".to_string() })),
                 };
                 if a > b { return Some(Err(PitruckError::RuntimeError { line, message: "rand: min <= max".to_string() })); }
-                let r = (self.next_rand() % ((b - a + 1) as u64)) as i64 + a;
+                let range = (b - a + 1) as u64;
+                let r = (self.next_rand() % range) as i64 + a;
                 Some(Ok(Value::Number(r as f64)))
             }
             "input" => {
@@ -66,7 +71,8 @@ impl Interpreter {
                 }
                 let mut line_buf = String::new();
                 io::stdin().lock().read_line(&mut line_buf).ok();
-                Some(Ok(Value::Str(line_buf.trim_end_matches('\n').trim_end_matches('\r').to_string())))
+                let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                Some(Ok(Value::Str(trimmed)))
             }
             "to_number" => {
                 if args.len() != 1 { return Some(Err(arity_err(1))); }
@@ -120,8 +126,8 @@ impl Interpreter {
             "sys_env" => {
                 if args.len() != 1 { return Some(Err(arity_err(1))); }
                 let val = match &args[0] {
-                    Value::Str(k) => std::env::var(k).unwrap_or_else(|_| "".to_string()),
-                    _ => "".to_string(),
+                    Value::Str(k) => std::env::var(k).unwrap_or_default(),
+                    _ => String::new(),
                 };
                 Some(Ok(Value::Str(val)))
             }
@@ -129,12 +135,11 @@ impl Interpreter {
                 if args.len() != 2 { return Some(Err(arity_err(2))); }
                 match (&args[0], &args[1]) {
                     (Value::Str(path), Value::Str(contents)) => {
-                        let p = std::path::Path::new(path);
-                        match fs::write(p, contents) {
-                            Ok(_) => Some(Ok(Value::Null)),
+                        match fs::write(path.as_str(), contents.as_str()) {
+                            Ok(_)  => Some(Ok(Value::Null)),
                             Err(e) => Some(Err(PitruckError::RuntimeError {
                                 line,
-                                message: format!("could not write file '{}': {e}", path),
+                                message: format!("could not write file '{path}': {e}"),
                             })),
                         }
                     }
@@ -148,12 +153,11 @@ impl Interpreter {
                 if args.len() != 1 { return Some(Err(arity_err(1))); }
                 match &args[0] {
                     Value::Str(path) => {
-                        let p = std::path::Path::new(path);
-                        match fs::read_to_string(p) {
+                        match fs::read_to_string(path.as_str()) {
                             Ok(contents) => Some(Ok(Value::Str(contents))),
                             Err(e) => Some(Err(PitruckError::RuntimeError {
                                 line,
-                                message: format!("could not read file '{}': {e}", path),
+                                message: format!("could not read file '{path}': {e}"),
                             })),
                         }
                     }
@@ -188,7 +192,7 @@ impl Interpreter {
         }
     }
 
-    pub fn run(&mut self, program: &[Stmt]) -> Result<(), PitruckError> { 
+    pub fn run(&mut self, program: &[Stmt]) -> Result<(), PitruckError> {
         for stmt in program {
             match self.exec_stmt(stmt)? {
                 Signal::Return(_) => break,
@@ -198,14 +202,16 @@ impl Interpreter {
         Ok(())
     }
 
+    #[inline]
     fn define(&mut self, name: &str, val: Value) {
         self.scopes.last_mut().unwrap().insert(name.to_string(), val);
     }
 
     fn assign(&mut self, name: &str, val: Value, line: usize) -> Result<(), PitruckError> {
+        // Single-pass: find the slot and write directly, no double-lookup
         for scope in self.scopes.iter_mut().rev() {
-            if scope.contains_key(name) {
-                scope.insert(name.to_string(), val);
+            if let Some(slot) = scope.get_mut(name) {
+                *slot = val;
                 return Ok(());
             }
         }
@@ -221,10 +227,12 @@ impl Interpreter {
         Err(PitruckError::RuntimeError { line, message: format!("undefined variable '{name}'") })
     }
 
+    #[inline]
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
     }
 
+    #[inline]
     fn pop_scope(&mut self) {
         self.scopes.pop();
     }
@@ -233,10 +241,16 @@ impl Interpreter {
         match stmt {
             Stmt::VarDecl { name, value, line } => {
                 let v = self.eval_expr(value)?;
-                if self.scopes.last().unwrap().contains_key(name) {
-                    return Err(PitruckError::RuntimeError { line: *line, message: format!("'{name}' is already declared") });
+                // entry() API: single lookup instead of contains_key + insert
+                match self.scopes.last_mut().unwrap().entry(name.to_string()) {
+                    Entry::Occupied(_) => {
+                        return Err(PitruckError::RuntimeError {
+                            line: *line,
+                            message: format!("'{name}' is already declared"),
+                        });
+                    }
+                    Entry::Vacant(e) => { e.insert(v); }
                 }
-                self.define(name, v);
                 Ok(Signal::None)
             }
             Stmt::Assign { name, value, line } => {
@@ -285,10 +299,15 @@ impl Interpreter {
                 }
             }
             Stmt::Bring { module, line } => {
+                // Skip re-loading already-imported modules (avoids disk I/O + re-parsing)
+                if self.loaded_modules.contains(module) {
+                    return Ok(Signal::None);
+                }
                 let path = format!("lib/{}.pr", module);
                 let source = fs::read_to_string(&path).map_err(|_| PitruckError::RuntimeError {
                     line: *line, message: format!("could not bring module '{module}'")
                 })?;
+                self.loaded_modules.insert(module.clone());
                 let mut lexer = crate::lexer::Lexer::new(&source);
                 let tokens = lexer.tokenize()?;
                 let mut parser = crate::parser::Parser::new(tokens);
@@ -305,69 +324,40 @@ impl Interpreter {
                 let mut method_map = HashMap::new();
                 for m in methods {
                     if let Stmt::FuncDef { name: mname, params, body, .. } = m {
-                        method_map.insert(mname.clone(), Value::Function { name: mname.clone(), params: params.clone(), body: body.clone() });
+                        method_map.insert(
+                            mname.clone(),
+                            Value::Function { name: mname.clone(), params: params.clone(), body: body.clone() },
+                        );
                     }
                 }
                 self.define(name, Value::Class { name: name.clone(), methods: method_map });
                 Ok(Signal::None)
             }
             Stmt::If { condition, then_branch, elif_branches, else_branch, .. } => {
-                let cond_val = self.eval_expr(condition)?;
-                if cond_val.is_truthy() {
-                    self.push_scope();
-                    for s in then_branch {
-                        if let Signal::Return(v) = self.exec_stmt(s)? {
-                            self.pop_scope();
-                            return Ok(Signal::Return(v));
-                        }
-                    }
-                    self.pop_scope();
-                    return Ok(Signal::None);
+                if self.eval_expr(condition)?.is_truthy() {
+                    return self.exec_block(then_branch);
                 }
                 for (elif_cond, elif_body) in elif_branches {
-                    let e_cond = self.eval_expr(elif_cond)?;
-                    if e_cond.is_truthy() {
-                        self.push_scope();
-                        for s in elif_body {
-                            if let Signal::Return(v) = self.exec_stmt(s)? {
-                                self.pop_scope();
-                                return Ok(Signal::Return(v));
-                            }
-                        }
-                        self.pop_scope();
-                        return Ok(Signal::None);
+                    if self.eval_expr(elif_cond)?.is_truthy() {
+                        return self.exec_block(elif_body);
                     }
                 }
                 if let Some(eb) = else_branch {
-                    self.push_scope();
-                    for s in eb {
-                        if let Signal::Return(v) = self.exec_stmt(s)? {
-                            self.pop_scope();
-                            return Ok(Signal::Return(v));
-                        }
-                    }
-                    self.pop_scope();
+                    return self.exec_block(eb);
                 }
                 Ok(Signal::None)
             }
             Stmt::While { condition, body, .. } => {
                 loop {
-                    let c = self.eval_expr(condition)?;
-                    if !c.is_truthy() { break; }
-                    self.push_scope();
-                    for s in body {
-                        if let Signal::Return(v) = self.exec_stmt(s)? {
-                            self.pop_scope();
-                            return Ok(Signal::Return(v));
-                        }
+                    if !self.eval_expr(condition)?.is_truthy() { break; }
+                    if let Signal::Return(v) = self.exec_block(body)? {
+                        return Ok(Signal::Return(v));
                     }
-                    self.pop_scope();
                 }
                 Ok(Signal::None)
             }
             Stmt::Match { expr, arms, default, .. } => {
                 let val = self.eval_expr(expr)?;
-                let mut matched = false;
                 for (arm_expr, body) in arms {
                     let arm_val = self.eval_expr(arm_expr)?;
                     if self.values_equal(&val, &arm_val) {
@@ -377,17 +367,14 @@ impl Interpreter {
                                 Signal::None => {}
                             }
                         }
-                        matched = true;
-                        break;
+                        return Ok(Signal::None);
                     }
                 }
-                if !matched {
-                    if let Some(def_body) = default {
-                        for s in def_body {
-                            match self.exec_stmt(s)? {
-                                Signal::Return(v) => return Ok(Signal::Return(v)),
-                                Signal::None => {}
-                            }
+                if let Some(def_body) = default {
+                    for s in def_body {
+                        match self.exec_stmt(s)? {
+                            Signal::Return(v) => return Ok(Signal::Return(v)),
+                            Signal::None => {}
                         }
                     }
                 }
@@ -408,6 +395,21 @@ impl Interpreter {
         }
     }
 
+    /// Execute a block in a fresh scope, returning early on Signal::Return.
+    /// Extracted to remove copy-pasted push/pop/iterate code from every branch.
+    #[inline]
+    fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Signal, PitruckError> {
+        self.push_scope();
+        for s in stmts {
+            if let Signal::Return(v) = self.exec_stmt(s)? {
+                self.pop_scope();
+                return Ok(Signal::Return(v));
+            }
+        }
+        self.pop_scope();
+        Ok(Signal::None)
+    }
+
     fn eval_expr(&mut self, expr: &Expr) -> Result<Value, PitruckError> {
         match expr {
             Expr::Number(n)    => Ok(Value::Number(*n)),
@@ -415,14 +417,14 @@ impl Interpreter {
             Expr::Bool(b)      => Ok(Value::Bool(*b)),
             Expr::Null         => Ok(Value::Null),
             Expr::Ident { name, line } => self.lookup(name, *line),
-            Expr::Self_ { line } => self.lookup("self", *line),
+            Expr::Self_ { line }       => self.lookup("self", *line),
 
             Expr::Lambda { params, body, .. } => {
                 Ok(Value::Function { name: "<lambda>".to_string(), params: params.clone(), body: body.clone() })
             }
 
             Expr::List { elements, .. } => {
-                let mut vec = Vec::new();
+                let mut vec = Vec::with_capacity(elements.len());
                 for e in elements {
                     vec.push(self.eval_expr(e)?);
                 }
@@ -430,7 +432,7 @@ impl Interpreter {
             }
 
             Expr::Dict { elements, line } => {
-                let mut map = HashMap::new();
+                let mut map = HashMap::with_capacity(elements.len());
                 for (k, v) in elements {
                     let k_val = self.eval_expr(k)?;
                     if let Value::Str(s) = k_val {
@@ -444,20 +446,21 @@ impl Interpreter {
 
             Expr::Get { object, name, line } => {
                 let obj = self.eval_expr(object)?;
-                if let Value::Instance { class_name: _, fields, methods } = obj.clone() {
+                // Match by ref first to avoid cloning the entire instance up front
+                if let Value::Instance { fields, methods, .. } = &obj {
                     if let Some(val) = fields.borrow().get(name) {
                         return Ok(val.clone());
                     }
                     if let Some(method) = methods.get(name) {
+                        // Only clone the method Value (a Function), not the whole methods map
                         return Ok(Value::BoundMethod {
-                            receiver: Box::new(obj),
+                            receiver: Box::new(obj.clone()),
                             method: Box::new(method.clone()),
                         });
                     }
-                    Err(PitruckError::RuntimeError { line: *line, message: format!("property '{}' not found", name) })
-                } else {
-                    Err(PitruckError::RuntimeError { line: *line, message: "only instances have properties".to_string() })
+                    return Err(PitruckError::RuntimeError { line: *line, message: format!("property '{}' not found", name) });
                 }
+                Err(PitruckError::RuntimeError { line: *line, message: "only instances have properties".to_string() })
             }
 
             Expr::IndexGet { object, index, line } => {
@@ -479,11 +482,7 @@ impl Interpreter {
                     }
                     Value::Dict(dict) => {
                         if let Value::Str(k) = idx {
-                            if let Some(v) = dict.borrow().get(&k) {
-                                Ok(v.clone())
-                            } else {
-                                Ok(Value::Null)
-                            }
+                            Ok(dict.borrow().get(&k).cloned().unwrap_or(Value::Null))
                         } else {
                             Err(PitruckError::RuntimeError { line: *line, message: "dict key must be a string".to_string() })
                         }
@@ -504,6 +503,7 @@ impl Interpreter {
             }
 
             Expr::BinOp { op, left, right, line } => {
+                // Short-circuit ops: evaluate right only if needed
                 if matches!(op, BinOpKind::And) {
                     let l = self.eval_expr(left)?;
                     return if !l.is_truthy() { Ok(l) } else { self.eval_expr(right) };
@@ -518,11 +518,12 @@ impl Interpreter {
             }
 
             Expr::Call { callee, args, line } => {
-                let mut evaluated_args = Vec::new();
+                let mut evaluated_args = Vec::with_capacity(args.len());
                 for a in args {
                     evaluated_args.push(self.eval_expr(a)?);
                 }
 
+                // Fast path: named builtins — no heap allocation for callee lookup
                 if let Expr::Ident { name, .. } = &**callee {
                     if let Some(result) = self.call_builtin(name, &evaluated_args, *line) {
                         return result;
@@ -534,17 +535,20 @@ impl Interpreter {
                 match callee_val {
                     Value::Function { params, body, .. } => {
                         if evaluated_args.len() != params.len() {
-                            return Err(PitruckError::RuntimeError { line: *line, message: format!("expected {} args", params.len()) });
+                            return Err(PitruckError::RuntimeError {
+                                line: *line,
+                                message: format!("expected {} args", params.len()),
+                            });
                         }
                         self.push_scope();
-                        for (i, p) in params.iter().enumerate() {
-                            self.define(p, evaluated_args[i].clone());
+                        for (p, arg) in params.iter().zip(evaluated_args) {
+                            self.define(p, arg);
                         }
                         let mut ret_val = Value::Null;
-                        for s in body {
-                            match self.exec_stmt(&s)? {
-                                Signal::Return(v) => { ret_val = v; break; },
-                                Signal::None => {}
+                        for s in body.iter() {
+                            if let Signal::Return(v) = self.exec_stmt(s)? {
+                                ret_val = v;
+                                break;
                             }
                         }
                         self.pop_scope();
@@ -558,40 +562,46 @@ impl Interpreter {
                         };
                         if let Some(Value::Function { params, body, .. }) = methods.get("init") {
                             if evaluated_args.len() != params.len() {
-                                return Err(PitruckError::RuntimeError { line: *line, message: format!("init expected {} args", params.len()) });
+                                return Err(PitruckError::RuntimeError {
+                                    line: *line,
+                                    message: format!("init expected {} args", params.len()),
+                                });
                             }
                             self.push_scope();
                             self.define("self", instance.clone());
-                            for (i, p) in params.iter().enumerate() {
-                                self.define(p, evaluated_args[i].clone());
+                            for (p, arg) in params.iter().zip(evaluated_args) {
+                                self.define(p, arg);
                             }
-                            for s in body {
-                                match self.exec_stmt(&s)? {
-                                    Signal::Return(_) => break,
-                                    Signal::None => {}
-                                }
+                            for s in body.iter() {
+                                if let Signal::Return(_) = self.exec_stmt(s)? { break; }
                             }
                             self.pop_scope();
                         } else if !evaluated_args.is_empty() {
-                            return Err(PitruckError::RuntimeError { line: *line, message: "class has no init method, but arguments provided".to_string() });
+                            return Err(PitruckError::RuntimeError {
+                                line: *line,
+                                message: "class has no init method, but arguments provided".to_string(),
+                            });
                         }
                         Ok(instance)
                     }
                     Value::BoundMethod { receiver, method } => {
                         if let Value::Function { params, body, .. } = *method {
                             if evaluated_args.len() != params.len() {
-                                return Err(PitruckError::RuntimeError { line: *line, message: format!("expected {} args", params.len()) });
+                                return Err(PitruckError::RuntimeError {
+                                    line: *line,
+                                    message: format!("expected {} args", params.len()),
+                                });
                             }
                             self.push_scope();
                             self.define("self", *receiver);
-                            for (i, p) in params.iter().enumerate() {
-                                self.define(p, evaluated_args[i].clone());
+                            for (p, arg) in params.iter().zip(evaluated_args) {
+                                self.define(p, arg);
                             }
                             let mut ret_val = Value::Null;
-                            for s in body {
-                                match self.exec_stmt(&s)? {
-                                    Signal::Return(v) => { ret_val = v; break; },
-                                    Signal::None => {}
+                            for s in body.iter() {
+                                if let Signal::Return(v) = self.exec_stmt(s)? {
+                                    ret_val = v;
+                                    break;
                                 }
                             }
                             self.pop_scope();
@@ -640,10 +650,12 @@ impl Interpreter {
             BinOpKind::Gt    => self.compare_nums(l, r, line, |a, b| a > b),
             BinOpKind::LtEq  => self.compare_nums(l, r, line, |a, b| a <= b),
             BinOpKind::GtEq  => self.compare_nums(l, r, line, |a, b| a >= b),
-            _ => Ok(Value::Null),
+            // And/Or are short-circuited in eval_expr and never reach here
+            BinOpKind::And | BinOpKind::Or => unreachable!("And/Or handled in eval_expr"),
         }
     }
 
+    #[inline]
     fn values_equal(&self, l: &Value, r: &Value) -> bool {
         match (l, r) {
             (Value::Number(a), Value::Number(b)) => a == b,
