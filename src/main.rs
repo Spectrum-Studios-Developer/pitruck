@@ -18,29 +18,29 @@ use interpreter::Interpreter;
 fn run_source(source: &str, show_perf: bool) -> bool {
     let total = Instant::now();
 
-    let lex_start_time = Instant::now();
+    let t0 = Instant::now();
     let mut lex = Lexer::new(source);
     let tokens = match lex.tokenize() {
         Ok(t)  => t,
         Err(e) => { eprintln!("{e}"); return false; }
     };
-    let lex_ms = lex_start_time.elapsed();
+    let lex_ms = t0.elapsed();
 
-    let parse_start_time = Instant::now();
+    let t1 = Instant::now();
     let mut par = Parser::new(tokens);
     let program = match par.parse_program() {
         Ok(p)  => p,
         Err(e) => { eprintln!("{e}"); return false; }
     };
-    let parse_ms = parse_start_time.elapsed();
+    let parse_ms = t1.elapsed();
 
-    let run_start_time = Instant::now();
+    let t2 = Instant::now();
     let mut vm = Interpreter::new();
     let ok = match vm.run(&program) {
         Ok(_)  => true,
         Err(e) => { eprintln!("{e}"); false }
     };
-    let run_ms = run_start_time.elapsed();
+    let run_ms = t2.elapsed();
 
     if show_perf {
         eprintln!(
@@ -54,32 +54,81 @@ fn run_source(source: &str, show_perf: bool) -> bool {
 
     ok
 }
+
+// Parse a raw query string like "name=alice&page=2" into a Pitruck dict literal source fragment.
+fn query_to_pitruck_dict(query: &str) -> String {
+    if query.is_empty() {
+        return "{}".to_string();
+    }
+    let pairs: Vec<String> = query
+        .split('&')
+        .filter_map(|pair| {
+            let mut kv = pair.splitn(2, '=');
+            let k = kv.next()?.trim();
+            let v = kv.next().unwrap_or("").trim();
+            if k.is_empty() { return None; }
+            Some(format!("\"{}\": \"{}\"", escape_str(k), escape_str(v)))
+        })
+        .collect();
+    format!("{{{}}}", pairs.join(", "))
+}
+
+// Parse raw HTTP headers into a Pitruck dict literal source fragment.
+fn headers_to_pitruck_dict(headers: &[String]) -> String {
+    let pairs: Vec<String> = headers
+        .iter()
+        .filter_map(|h| {
+            let mut kv = h.splitn(2, ':');
+            let k = kv.next()?.trim().to_lowercase();
+            let v = kv.next().unwrap_or("").trim().to_string();
+            Some(format!("\"{}\": \"{}\"", escape_str(&k), escape_str(&v)))
+        })
+        .collect();
+    format!("{{{}}}", pairs.join(", "))
+}
+
 fn serve_request(
     source: &str,
     method: &str,
     path: &str,
     query: &str,
     body: &str,
-    _headers: &[String],
-) -> (u16, String) {
+    headers: &[String],
+    debug: bool,
+) -> (u16, String, Vec<(String, String)>) {
+    let query_dict   = query_to_pitruck_dict(query);
+    let headers_dict = headers_to_pitruck_dict(headers);
+
+    // Inject structured request/response objects before user code runs.
     let preamble = format!(
         r#"
 class __Request {{
-    func init(method, path, query, body) {{
-        self.method = method
-        self.path   = path
-        self.query  = query
-        self.body   = body
+    func init(method, path, query_str, query, body, headers) {{
+        self.method    = method
+        self.path      = path
+        self.query_str = query_str
+        self.query     = query
+        self.body      = body
+        self.headers   = headers
     }}
 }}
-var request = __Request({method_lit}, {path_lit}, {query_lit}, {body_lit})
-var response_status = 200
-var response_body   = ""
+
+class __Response {{
+    func init() {{
+        self.status  = 200
+        self.body    = ""
+    }}
+}}
+
+var request  = __Request({method_lit}, {path_lit}, {query_str_lit}, {query_dict}, {body_lit}, {headers_dict})
+var response = __Response()
 "#,
-        method_lit = escape_pitruck_str(method),
-        path_lit   = escape_pitruck_str(path),
-        query_lit  = escape_pitruck_str(query),
-        body_lit   = escape_pitruck_str(body),
+        method_lit    = escape_pitruck_str(method),
+        path_lit      = escape_pitruck_str(path),
+        query_str_lit = escape_pitruck_str(query),
+        query_dict    = query_dict,
+        body_lit      = escape_pitruck_str(body),
+        headers_dict  = headers_dict,
     );
 
     let full_source = format!("{}\n{}", preamble, source);
@@ -88,41 +137,49 @@ var response_body   = ""
     let tokens = match lex.tokenize() {
         Ok(t)  => t,
         Err(e) => {
-            eprintln!("[serve] lex error: {e}");
-            return (500, format!("<pre>Lex error:\n{e}</pre>"));
+            if debug { eprintln!("[pitruck] lex error: {e}"); }
+            return (500, format!("<pre>Lex Error\n{e}</pre>"), vec![]);
         }
     };
+
     let mut par = Parser::new(tokens);
     let program = match par.parse_program() {
         Ok(p)  => p,
         Err(e) => {
-            eprintln!("[serve] parse error: {e}");
-            return (500, format!("<pre>Parse error:\n{e}</pre>"));
+            if debug { eprintln!("[pitruck] parse error: {e}"); }
+            return (500, format!("<pre>Parse Error\n{e}</pre>"), vec![]);
         }
     };
 
     let mut vm = Interpreter::new();
     if let Err(e) = vm.run(&program) {
-        eprintln!("[serve] runtime error: {e}");
-        return (500, format!("<pre>Runtime error:\n{e}</pre>"));
+        if debug { eprintln!("[pitruck] runtime error: {e}"); }
+        return (500, format!("<pre>Runtime Error\n{e}</pre>"), vec![]);
     }
 
-    let status = vm.read_number("response_status").unwrap_or(200.0) as u16;
-    let html   = vm.read_string("response_body").unwrap_or_default();
+    let status  = vm.read_number("response_status")
+        .unwrap_or_else(|| vm.read_response_status().unwrap_or(200.0)) as u16;
+    let html    = vm.read_response_body()
+        .or_else(|| vm.read_string("response_body"))
+        .unwrap_or_default();
+    let headers = vm.read_response_headers();
 
-    (status, html)
+    (status, html, headers)
+}
+
+fn escape_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn escape_pitruck_str(s: &str) -> String {
-    let inner = s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{}\"", inner)
+    format!("\"{}\"", escape_str(s))
 }
 
 fn repl() {
     let stdin  = io::stdin();
     let stdout = io::stdout();
 
-    println!("Pitruck v1.2 - type 'exit' to quit");
+    println!("Pitruck v1.3 - type 'exit' to quit");
 
     let mut vm = Interpreter::new();
 
@@ -142,10 +199,7 @@ fn repl() {
         let mut lex = Lexer::new(trimmed);
         let tokens = match lex.tokenize() {
             Ok(t) => t,
-            Err(e) => {
-                println!("{}", e);
-                std::process::exit(1);
-            }
+            Err(e) => { eprintln!("{e}"); continue; }
         };
 
         let mut par = Parser::new(tokens);
@@ -162,6 +216,48 @@ fn repl() {
     }
 }
 
+// Read a full HTTP request from a TCP stream, handling chunked/slow clients by
+// reading until we have all headers and the declared Content-Length body bytes.
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+
+                // Stop once we have the full body (headers + content-length bytes).
+                if let Some(header_end) = find_header_end(&buf) {
+                    let header_str = String::from_utf8_lossy(&buf[..header_end]);
+                    if let Some(len) = parse_content_length(&header_str) {
+                        let total = header_end + 4 + len; // +4 for \r\n\r\n
+                        if buf.len() >= total { break; }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_content_length(headers: &str) -> Option<usize> {
+    for line in headers.lines() {
+        if line.to_lowercase().starts_with("content-length:") {
+            return line.splitn(2, ':').nth(1)?.trim().parse().ok();
+        }
+    }
+    None
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -170,123 +266,145 @@ fn main() {
         return;
     }
 
-    let cmd = args[1].as_str();
+    // Collect flags before dispatch.
+    let debug     = args.contains(&"--debug".to_string());
+    let show_perf = args.contains(&"--speed".to_string());
 
-    match cmd {
+    match args[1].as_str() {
         "--help" => {
-            println!("Pitruck Interpreter v1.2");
+            println!("Pitruck Interpreter v1.3");
             println!("Usage: pitruck [command] [args]");
+            println!();
             println!("Commands:");
-            println!("  [file.pr]                  Run a pitruck source file");
-            println!("  [file.pr] --speed          Run and show execution speed telemetry");
-            println!("  --serve <file.pr> [port]   Run file.pr as an HTTP request handler (default port 8000)");
-            println!("  lib install <path/url>     Install a library locally or from a URL");
-            println!("  lib list                   List installed libraries");
-            println!("  lib delete <library>       Delete a library");
-            println!("  --help                     Show this help message");
-            return;
+            println!("  [file.pr]                         Run a source file");
+            println!("  [file.pr] --speed                 Run and show execution timing");
+            println!("  --serve <file.pr> [--port N]      Serve file.pr as an HTTP handler");
+            println!("  --serve <dir/>    [--port N]      File-based routing from directory");
+            println!("  lib install <path|url>            Install a library");
+            println!("  lib list                          List installed libraries");
+            println!("  lib delete <name>                 Delete a library");
+            println!("  --help                            Show this message");
+            println!();
+            println!("Flags:");
+            println!("  --port N     HTTP port (default 8000)");
+            println!("  --debug      Verbose server error output");
+            println!("  --speed      Show lex/parse/run timings");
         }
 
         "--serve" => {
             if args.len() < 3 {
-                eprintln!("Usage: pitruck --serve <file.pr> [port]");
+                eprintln!("Usage: pitruck --serve <file.pr|dir/> [--port N]");
                 std::process::exit(1);
             }
-            let script_path = &args[2];
-            let port = args.get(3).map(|s| s.as_str()).unwrap_or("8000");
+
+            let target = &args[2];
+            let port = args.iter()
+                .position(|a| a == "--port")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.as_str())
+                .unwrap_or("8000");
+
             let addr = format!("0.0.0.0:{}", port);
-
-            let source = match fs::read_to_string(script_path) {
-                Ok(s)  => s,
-                Err(e) => {
-                    eprintln!("Cannot read '{}': {}", script_path, e);
-                    std::process::exit(1);
-                }
-            };
-
             let listener = match std::net::TcpListener::bind(&addr) {
                 Ok(l)  => l,
-                Err(e) => {
-                    eprintln!("Could not bind to {}: {}", addr, e);
-                    std::process::exit(1);
-                }
+                Err(e) => { eprintln!("Cannot bind to {addr}: {e}"); std::process::exit(1); }
             };
-            println!("Pitruck Server  -  http://localhost:{}", port);
-            println!("Handler         -  {}", script_path);
+
+            let is_dir = fs::metadata(target).map(|m| m.is_dir()).unwrap_or(false);
+
+            println!("Pitruck Server  →  http://localhost:{}", port);
+            if is_dir {
+                println!("Routing         →  {} (file-based)", target);
+            } else {
+                println!("Handler         →  {}", target);
+            }
+            if debug { println!("Mode            →  debug"); }
 
             for stream in listener.incoming() {
-                if let Ok(mut stream) = stream {
-                    let mut buffer = [0u8; 8192];
-                    let n = stream.read(&mut buffer).unwrap_or(0);
-                    let raw = String::from_utf8_lossy(&buffer[..n]);
+                let mut stream = match stream {
+                    Ok(s)  => s,
+                    Err(e) => { eprintln!("[accept] {e}"); continue; }
+                };
 
-                    let mut raw_lines = raw.lines();
-                    let request_line = raw_lines.next().unwrap_or("GET / HTTP/1.1");
-                    let mut parts  = request_line.split_whitespace();
-                    let method     = parts.next().unwrap_or("GET").to_string();
-                    let full_path  = parts.next().unwrap_or("/").to_string();
+                let raw = read_http_request(&mut stream);
+                let mut lines = raw.lines();
 
-                    let (route, query) = match full_path.splitn(2, '?').collect::<Vec<_>>().as_slice() {
-                        [p, qs] => (p.to_string(), qs.to_string()),
-                        [p]     => (p.to_string(), String::new()),
-                        _       => (full_path.clone(), String::new()),
-                    };
+                let request_line = lines.next().unwrap_or("GET / HTTP/1.1");
+                let mut parts  = request_line.split_whitespace();
+                let method     = parts.next().unwrap_or("GET").to_string();
+                let full_path  = parts.next().unwrap_or("/").to_string();
 
-                    let mut headers: Vec<String> = Vec::new();
-                    for hl in raw_lines.by_ref() {
-                        if hl.is_empty() { break; }
-                        headers.push(hl.to_string());
+                let (route, query) = if let Some(pos) = full_path.find('?') {
+                    (full_path[..pos].to_string(), full_path[pos + 1..].to_string())
+                } else {
+                    (full_path.clone(), String::new())
+                };
+
+                let mut headers: Vec<String> = Vec::new();
+                for hl in lines.by_ref() {
+                    if hl.is_empty() || hl == "\r" { break; }
+                    headers.push(hl.trim_end().to_string());
+                }
+                let body: String = lines.collect::<Vec<_>>().join("\n").trim_matches('\0').to_string();
+
+                // Resolve the handler source: single file or file-based routing.
+                let source = if is_dir {
+                    let candidate = format!("{}{}.pr", target.trim_end_matches('/'), route);
+                    let fallback  = format!("{}/index.pr", target.trim_end_matches('/'));
+                    fs::read_to_string(&candidate)
+                        .or_else(|_| fs::read_to_string(&fallback))
+                        .unwrap_or_else(|_| "response.status = 404\nresponse.body = \"404 Not Found\"".to_string())
+                } else {
+                    match fs::read_to_string(target) {
+                        Ok(s)  => s,
+                        Err(e) => { eprintln!("Cannot read '{}': {}", target, e); continue; }
                     }
+                };
 
-                    let body: String = raw_lines
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        .trim_matches('\0')
-                        .to_string();
+                let t0 = Instant::now();
+                let (status_code, html, extra_headers) =
+                    serve_request(&source, &method, &route, &query, &body, &headers, debug);
+                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-                    let now = Instant::now();
-                    let (status_code, html) = serve_request(
-                        &source, &method, &route, &query, &body, &headers,
-                    );
-                    let elapsed_ms = now.elapsed().as_secs_f64() * 1000.0;
+                let status_text = match status_code {
+                    200 => "OK", 201 => "Created", 204 => "No Content",
+                    301 => "Moved Permanently", 302 => "Found",
+                    400 => "Bad Request", 401 => "Unauthorized",
+                    403 => "Forbidden", 404 => "Not Found",
+                    500 => "Internal Server Error", _ => "OK",
+                };
 
-                    let status_text = match status_code {
-                        200 => "OK",
-                        301 => "Moved Permanently",
-                        302 => "Found",
-                        400 => "Bad Request",
-                        403 => "Forbidden",
-                        404 => "Not Found",
-                        500 => "Internal Server Error",
-                        _   => "OK",
-                    };
-
-                    let content_type =
-                        if html.trim_start().starts_with("<!DOCTYPE")
-                            || html.trim_start().starts_with('<')
-                        {
+                let content_type = extra_headers.iter()
+                    .find(|(k, _)| k.to_lowercase() == "content-type")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or_else(|| {
+                        if html.trim_start().starts_with("<!DOCTYPE") || html.trim_start().starts_with('<') {
                             "text/html; charset=utf-8"
                         } else {
                             "text/plain; charset=utf-8"
-                        };
+                        }
+                    });
 
-                    let response = format!(
-                        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        status_code, status_text, content_type, html.len(), html
-                    );
-
-                    stream.write_all(response.as_bytes()).ok();
-                    stream.flush().ok();
-
-                    // access log
-                    let snippet: String = html.chars().take(60).collect();
-                    println!(
-                        "[{}] {} {} ({:.1}ms) → {}…",
-                        status_code, method, route, elapsed_ms, snippet
-                    );
+                let mut response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    status_code, status_text, content_type, html.len()
+                );
+                for (k, v) in &extra_headers {
+                    if k.to_lowercase() != "content-type" {
+                        response.push_str(&format!("{}: {}\r\n", k, v));
+                    }
                 }
+                response.push_str(&format!("\r\n{}", html));
+
+                if let Err(e) = stream.write_all(response.as_bytes()) {
+                    eprintln!("[write] {e}");
+                }
+                if let Err(e) = stream.flush() {
+                    eprintln!("[flush] {e}");
+                }
+
+                println!("[{}] {} {} ({:.1}ms)", status_code, method, route, elapsed_ms);
             }
-            return;
         }
 
         "lib" => {
@@ -294,13 +412,9 @@ fn main() {
                 eprintln!("Usage: pitruck lib [install|list|delete]");
                 std::process::exit(1);
             }
-            let subcmd = args[2].as_str();
-            match subcmd {
+            match args[2].as_str() {
                 "install" => {
-                    if args.len() < 4 {
-                        eprintln!("Usage: pitruck lib install <url_or_path>");
-                        std::process::exit(1);
-                    }
+                    if args.len() < 4 { eprintln!("Usage: pitruck lib install <url_or_path>"); std::process::exit(1); }
                     let source = &args[3];
                     let lib_name = if source.starts_with("http") {
                         source.split('/').last().unwrap_or("unknown").trim_end_matches(".pr")
@@ -315,21 +429,21 @@ fn main() {
 
                     if source.starts_with("http") {
                         println!("Downloading '{}'...", source);
-                        let status = std::process::Command::new("curl")
+                        let ok = std::process::Command::new("curl")
                             .args(["-sL", source, "-o", &dest])
-                            .status();
-                        match status {
-                            Ok(s) if s.success() => println!("Installed '{}' successfully.", lib_name),
-                            _ => println!("Failed to download library '{}'.", lib_name),
-                        }
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false);
+                        if ok { println!("Installed '{}' successfully.", lib_name); }
+                        else  { eprintln!("Failed to download '{}'.", lib_name); }
                     } else if fs::metadata(source).is_ok() {
                         if fs::copy(source, &dest).is_ok() {
                             println!("Installed '{}' successfully.", lib_name);
                         } else {
-                            println!("Failed to copy library '{}'.", lib_name);
+                            eprintln!("Failed to copy '{}'.", lib_name);
                         }
                     } else {
-                        println!("Could not resolve source '{}'. If this is a local path, the file does not exist. If this is a package name, the registry is offline.", source);
+                        eprintln!("Source '{}' not found.", source);
                     }
                 }
                 "list" => {
@@ -340,7 +454,7 @@ fn main() {
                             if let Ok(name) = entry.file_name().into_string() {
                                 if name.ends_with(".pr") {
                                     let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                                    println!("  - {:<15} ({} bytes)", name.trim_end_matches(".pr"), size);
+                                    println!("  - {:<20} ({} bytes)", name.trim_end_matches(".pr"), size);
                                     found = true;
                                 }
                             }
@@ -351,40 +465,26 @@ fn main() {
                     }
                 }
                 "delete" => {
-                    if args.len() < 4 {
-                        eprintln!("Usage: pitruck lib delete <library>");
-                        std::process::exit(1);
-                    }
-                    let lib_name = &args[3];
-                    let path = format!("lib/{}.pr", lib_name);
+                    if args.len() < 4 { eprintln!("Usage: pitruck lib delete <name>"); std::process::exit(1); }
+                    let path = format!("lib/{}.pr", &args[3]);
                     if fs::remove_file(&path).is_ok() {
-                        println!("Deleted library '{}' successfully.", lib_name);
+                        println!("Deleted '{}' successfully.", &args[3]);
                     } else {
-                        println!("Library '{}' not found.", lib_name);
+                        eprintln!("Library '{}' not found.", &args[3]);
                     }
                 }
-                _ => {
-                    eprintln!("Unknown lib command '{}'", subcmd);
-                    std::process::exit(1);
-                }
+                other => { eprintln!("Unknown lib subcommand '{}'", other); std::process::exit(1); }
             }
-            return;
         }
-        _ => {}
-    }
 
-    let path = &args[1];
-    let show_perf = args.len() > 2 && args[2] == "--speed";
-
-    let source = match fs::read_to_string(path) {
-        Ok(s)  => s,
-        Err(e) => {
-            eprintln!("Cannot read file '{path}': {e}");
-            std::process::exit(1);
+        path => {
+            let source = match fs::read_to_string(path) {
+                Ok(s)  => s,
+                Err(e) => { eprintln!("Cannot read file '{path}': {e}"); std::process::exit(1); }
+            };
+            if !run_source(&source, show_perf) {
+                std::process::exit(1);
+            }
         }
-    };
-
-    if !run_source(&source, show_perf) {
-        std::process::exit(1);
     }
 }

@@ -57,9 +57,9 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
-            Value::Class { name, .. } => write!(f, "<class {name}>"),
-            Value::Instance { class_name, .. } => write!(f, "<instance of {class_name}>"),
-            Value::BoundMethod { method, .. } => write!(f, "<bound method {}>", method),
+            Value::Class { name, .. }             => write!(f, "<class {name}>"),
+            Value::Instance { class_name, .. }    => write!(f, "<instance of {class_name}>"),
+            Value::BoundMethod { method, .. }     => write!(f, "<bound method {}>", method),
         }
     }
 }

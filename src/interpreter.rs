@@ -15,43 +15,96 @@ pub enum Signal {
 }
 
 pub struct Interpreter {
-    scopes: Vec<HashMap<String, Value>>,
-    start: Instant,
-    rand_seed: u64,
-    loaded_modules: HashSet<String>,
+    scopes:          Vec<HashMap<String, Value>>,
+    start:           Instant,
+    rand_seed:       u64,
+    loaded_modules:  HashSet<String>,
+
+    // When true, file I/O builtins are blocked (used in --serve mode).
+    sandboxed:       bool,
 }
 
 impl Interpreter {
     pub fn new() -> Self {
         let mut globals = HashMap::new();
         globals.insert("PI".to_string(), Value::Number(std::f64::consts::PI));
-        globals.insert("E".to_string(), Value::Number(std::f64::consts::E));
+        globals.insert("E".to_string(),  Value::Number(std::f64::consts::E));
         Interpreter {
             scopes: vec![globals],
-            start: Instant::now(),
+            start:  Instant::now(),
             rand_seed: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
             loaded_modules: HashSet::new(),
+            sandboxed: false,
         }
     }
 
+    pub fn set_sandboxed(&mut self, v: bool) {
+        self.sandboxed = v;
+    }
+
+    // --- Readers used by main.rs to extract response state after execution ---
 
     pub fn read_number(&self, name: &str) -> Option<f64> {
         for scope in self.scopes.iter().rev() {
-            if let Some(Value::Number(n)) = scope.get(name) {
-                return Some(*n);
+            if let Some(Value::Number(n)) = scope.get(name) { return Some(*n); }
+        }
+        None
+    }
+
+    pub fn read_string(&self, name: &str) -> Option<String> {
+        for scope in self.scopes.iter().rev() {
+            match scope.get(name) {
+                Some(Value::Str(s)) => return Some(s.clone()),
+                Some(other)         => return Some(format!("{}", other)),
+                None                => {}
             }
         }
         None
     }
-    pub fn read_string(&self, name: &str) -> Option<String> {
+
+    // Read response.status from the structured __Response instance.
+    pub fn read_response_status(&self) -> Option<f64> {
+        let inst = self.get_instance("response")?;
+        let fields = inst.borrow();
+        match fields.get("status") {
+            Some(Value::Number(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    // Read response.body from the structured __Response instance.
+    pub fn read_response_body(&self) -> Option<String> {
+        let inst = self.get_instance("response")?;
+        let fields = inst.borrow();
+        match fields.get("body") {
+            Some(Value::Str(s)) => Some(s.clone()),
+            Some(other)         => Some(format!("{}", other)),
+            None                => None,
+        }
+    }
+
+    // Read response.headers (a dict) from the structured __Response instance.
+    pub fn read_response_headers(&self) -> Vec<(String, String)> {
+        let inst = match self.get_instance("response") {
+            Some(i) => i,
+            None    => return vec![],
+        };
+        let fields = inst.borrow();
+        match fields.get("headers") {
+            Some(Value::Dict(d)) => d.borrow().iter()
+                .map(|(k, v)| (k.clone(), format!("{}", v)))
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    fn get_instance(&self, name: &str) -> Option<Rc<RefCell<HashMap<String, Value>>>> {
         for scope in self.scopes.iter().rev() {
-            match scope.get(name) {
-                Some(Value::Str(s))  => return Some(s.clone()),
-                Some(other)          => return Some(format!("{}", other)),
-                None                 => {}
+            if let Some(Value::Instance { fields, .. }) = scope.get(name) {
+                return Some(fields.clone());
             }
         }
         None
@@ -68,7 +121,7 @@ impl Interpreter {
     fn call_builtin(&mut self, name: &str, args: &[Value], line: usize) -> Option<Result<Value, PitruckError>> {
         let arity_err = |expected: usize| PitruckError::RuntimeError {
             line,
-            message: format!("'{name}' expects {expected} argument(s), got {}", args.len()),
+            message: format!("'{name}' expects {expected} arg(s), got {}", args.len()),
         };
 
         match name {
@@ -78,9 +131,8 @@ impl Interpreter {
                     (Value::Number(a), Value::Number(b)) => (*a as i64, *b as i64),
                     _ => return Some(Err(PitruckError::RuntimeError { line, message: "rand requires numbers".to_string() })),
                 };
-                if a > b { return Some(Err(PitruckError::RuntimeError { line, message: "rand: min <= max".to_string() })); }
-                let range = (b - a + 1) as u64;
-                let r = (self.next_rand() % range) as i64 + a;
+                if a > b { return Some(Err(PitruckError::RuntimeError { line, message: "rand: min must be <= max".to_string() })); }
+                let r = (self.next_rand() % (b - a + 1) as u64) as i64 + a;
                 Some(Ok(Value::Number(r as f64)))
             }
             "input" => {
@@ -98,9 +150,9 @@ impl Interpreter {
                 if args.len() != 1 { return Some(Err(arity_err(1))); }
                 match &args[0] {
                     Value::Number(n) => Some(Ok(Value::Number(*n))),
-                    Value::Str(s) => match s.trim().parse::<f64>() {
+                    Value::Str(s)    => match s.trim().parse::<f64>() {
                         Ok(n)  => Some(Ok(Value::Number(n))),
-                        Err(_) => Some(Err(PitruckError::RuntimeError { line, message: "cannot convert to number".to_string() })),
+                        Err(_) => Some(Err(PitruckError::RuntimeError { line, message: format!("cannot convert \"{s}\" to number") })),
                     },
                     Value::Bool(b) => Some(Ok(Value::Number(if *b { 1.0 } else { 0.0 }))),
                     _ => Some(Err(PitruckError::RuntimeError { line, message: "cannot convert null to number".to_string() })),
@@ -119,18 +171,117 @@ impl Interpreter {
                 };
                 Some(Ok(Value::Bool(ok)))
             }
+            // Escape a string for safe HTML output, preventing XSS in templates.
+            "html_escape" => {
+                if args.len() != 1 { return Some(Err(arity_err(1))); }
+                let s = format!("{}", args[0]);
+                let escaped = s
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&#39;");
+                Some(Ok(Value::Str(escaped)))
+            }
             "clear" => {
                 print!("\x1b[2J\x1b[1;1H");
                 io::stdout().flush().ok();
                 Some(Ok(Value::Null))
             }
+            "len" => {
+                if args.len() != 1 { return Some(Err(arity_err(1))); }
+                match &args[0] {
+                    Value::Str(s)    => Some(Ok(Value::Number(s.chars().count() as f64))),
+                    Value::List(l)   => Some(Ok(Value::Number(l.borrow().len() as f64))),
+                    Value::Dict(d)   => Some(Ok(Value::Number(d.borrow().len() as f64))),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "len requires string, list, or dict".to_string() })),
+                }
+            }
+            "push" => {
+                if args.len() != 2 { return Some(Err(arity_err(2))); }
+                match &args[0] {
+                    Value::List(l) => { l.borrow_mut().push(args[1].clone()); Some(Ok(Value::Null)) }
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "push requires a list".to_string() })),
+                }
+            }
+            "pop" => {
+                if args.len() != 1 { return Some(Err(arity_err(1))); }
+                match &args[0] {
+                    Value::List(l) => {
+                        let v = l.borrow_mut().pop().unwrap_or(Value::Null);
+                        Some(Ok(v))
+                    }
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "pop requires a list".to_string() })),
+                }
+            }
+            "contains" => {
+                if args.len() != 2 { return Some(Err(arity_err(2))); }
+                match (&args[0], &args[1]) {
+                    (Value::Str(haystack), Value::Str(needle)) => {
+                        Some(Ok(Value::Bool(haystack.contains(needle.as_str()))))
+                    }
+                    (Value::List(l), needle) => {
+                        let found = l.borrow().iter().any(|v| self.values_equal(v, needle));
+                        Some(Ok(Value::Bool(found)))
+                    }
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "contains requires (string, string) or (list, value)".to_string() })),
+                }
+            }
+            "split" => {
+                if args.len() != 2 { return Some(Err(arity_err(2))); }
+                match (&args[0], &args[1]) {
+                    (Value::Str(s), Value::Str(sep)) => {
+                        let parts: Vec<Value> = s.split(sep.as_str()).map(|p| Value::Str(p.to_string())).collect();
+                        Some(Ok(Value::List(Rc::new(RefCell::new(parts)))))
+                    }
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "split requires (string, string)".to_string() })),
+                }
+            }
+            "join" => {
+                if args.len() != 2 { return Some(Err(arity_err(2))); }
+                match (&args[0], &args[1]) {
+                    (Value::List(l), Value::Str(sep)) => {
+                        let parts: Vec<String> = l.borrow().iter().map(|v| format!("{}", v)).collect();
+                        Some(Ok(Value::Str(parts.join(sep))))
+                    }
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "join requires (list, string)".to_string() })),
+                }
+            }
+            "trim" => {
+                if args.len() != 1 { return Some(Err(arity_err(1))); }
+                match &args[0] {
+                    Value::Str(s) => Some(Ok(Value::Str(s.trim().to_string()))),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "trim requires string".to_string() })),
+                }
+            }
+            "upper" => {
+                if args.len() != 1 { return Some(Err(arity_err(1))); }
+                match &args[0] {
+                    Value::Str(s) => Some(Ok(Value::Str(s.to_uppercase()))),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "upper requires string".to_string() })),
+                }
+            }
+            "lower" => {
+                if args.len() != 1 { return Some(Err(arity_err(1))); }
+                match &args[0] {
+                    Value::Str(s) => Some(Ok(Value::Str(s.to_lowercase()))),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "lower requires string".to_string() })),
+                }
+            }
+            "replace" => {
+                if args.len() != 3 { return Some(Err(arity_err(3))); }
+                match (&args[0], &args[1], &args[2]) {
+                    (Value::Str(s), Value::Str(from), Value::Str(to)) => {
+                        Some(Ok(Value::Str(s.replace(from.as_str(), to.as_str()))))
+                    }
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "replace requires (string, string, string)".to_string() })),
+                }
+            }
             "time" => {
                 let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 Some(Ok(Value::Str(format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs % 3600) / 60, secs % 60))))
             }
-            "sys_os" => {
-                Some(Ok(Value::Str(std::env::consts::OS.to_string())))
-            }
+            "sys_os" => Some(Ok(Value::Str(std::env::consts::OS.to_string()))),
             "sys_exit" => {
                 if args.len() != 1 { return Some(Err(arity_err(1))); }
                 let code = match &args[0] { Value::Number(n) => *n as i32, _ => 0 };
@@ -152,60 +303,75 @@ impl Interpreter {
                 Some(Ok(Value::Str(val)))
             }
             "sys_writefile" => {
+                if self.sandboxed {
+                    return Some(Err(PitruckError::RuntimeError { line, message: "file I/O is not allowed in serve mode".to_string() }));
+                }
                 if args.len() != 2 { return Some(Err(arity_err(2))); }
                 match (&args[0], &args[1]) {
                     (Value::Str(path), Value::Str(contents)) => {
                         match fs::write(path.as_str(), contents.as_str()) {
                             Ok(_)  => Some(Ok(Value::Null)),
-                            Err(e) => Some(Err(PitruckError::RuntimeError {
-                                line,
-                                message: format!("could not write file '{path}': {e}"),
-                            })),
+                            Err(e) => Some(Err(PitruckError::RuntimeError { line, message: format!("write_file '{path}': {e}") })),
                         }
                     }
-                    _ => Some(Err(PitruckError::RuntimeError {
-                        line,
-                        message: "sys_writefile requires two strings".to_string(),
-                    })),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "sys_writefile(path, contents) requires two strings".to_string() })),
                 }
             }
             "sys_readfile" => {
+                if self.sandboxed {
+                    return Some(Err(PitruckError::RuntimeError { line, message: "file I/O is not allowed in serve mode".to_string() }));
+                }
                 if args.len() != 1 { return Some(Err(arity_err(1))); }
                 match &args[0] {
                     Value::Str(path) => {
                         match fs::read_to_string(path.as_str()) {
-                            Ok(contents) => Some(Ok(Value::Str(contents))),
-                            Err(e) => Some(Err(PitruckError::RuntimeError {
-                                line,
-                                message: format!("could not read file '{path}': {e}"),
-                            })),
+                            Ok(s)  => Some(Ok(Value::Str(s))),
+                            Err(e) => Some(Err(PitruckError::RuntimeError { line, message: format!("read_file '{path}': {e}") })),
                         }
                     }
-                    _ => Some(Err(PitruckError::RuntimeError {
-                        line,
-                        message: "sys_readfile requires a string".to_string(),
-                    })),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "sys_readfile(path) requires a string".to_string() })),
                 }
             }
-            "math_abs" => {
+            "math_abs"  => {
                 if args.len() != 1 { return Some(Err(arity_err(1))); }
                 match &args[0] {
                     Value::Number(n) => Some(Ok(Value::Number(n.abs()))),
-                    _ => Some(Err(PitruckError::RuntimeError { line, message: "requires number".to_string() })),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "abs requires number".to_string() })),
                 }
             }
             "math_sqrt" => {
                 if args.len() != 1 { return Some(Err(arity_err(1))); }
                 match &args[0] {
                     Value::Number(n) => Some(Ok(Value::Number(n.sqrt()))),
-                    _ => Some(Err(PitruckError::RuntimeError { line, message: "requires number".to_string() })),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "sqrt requires number".to_string() })),
                 }
             }
             "math_pow" => {
                 if args.len() != 2 { return Some(Err(arity_err(2))); }
                 match (&args[0], &args[1]) {
                     (Value::Number(a), Value::Number(b)) => Some(Ok(Value::Number(a.powf(*b)))),
-                    _ => Some(Err(PitruckError::RuntimeError { line, message: "requires two numbers".to_string() })),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "pow requires two numbers".to_string() })),
+                }
+            }
+            "floor" => {
+                if args.len() != 1 { return Some(Err(arity_err(1))); }
+                match &args[0] {
+                    Value::Number(n) => Some(Ok(Value::Number(n.floor()))),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "floor requires number".to_string() })),
+                }
+            }
+            "ceil" => {
+                if args.len() != 1 { return Some(Err(arity_err(1))); }
+                match &args[0] {
+                    Value::Number(n) => Some(Ok(Value::Number(n.ceil()))),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "ceil requires number".to_string() })),
+                }
+            }
+            "round" => {
+                if args.len() != 1 { return Some(Err(arity_err(1))); }
+                match &args[0] {
+                    Value::Number(n) => Some(Ok(Value::Number(n.round()))),
+                    _ => Some(Err(PitruckError::RuntimeError { line, message: "round requires number".to_string() })),
                 }
             }
             _ => None,
@@ -234,27 +400,21 @@ impl Interpreter {
                 return Ok(());
             }
         }
-        Err(PitruckError::RuntimeError { line, message: format!("undefined variable '{name}'") })
+        Err(PitruckError::RuntimeError { line, message: format!("undefined variable '{name}' — did you mean to use 'var'?") })
     }
 
     fn lookup(&self, name: &str, line: usize) -> Result<Value, PitruckError> {
         for scope in self.scopes.iter().rev() {
-            if let Some(v) = scope.get(name) {
-                return Ok(v.clone());
-            }
+            if let Some(v) = scope.get(name) { return Ok(v.clone()); }
         }
         Err(PitruckError::RuntimeError { line, message: format!("undefined variable '{name}'") })
     }
 
     #[inline]
-    fn push_scope(&mut self) {
-        self.scopes.push(HashMap::new());
-    }
+    fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
 
     #[inline]
-    fn pop_scope(&mut self) {
-        self.scopes.pop();
-    }
+    fn pop_scope(&mut self) { self.scopes.pop(); }
 
     fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Signal, PitruckError> {
         match stmt {
@@ -264,7 +424,7 @@ impl Interpreter {
                     Entry::Occupied(_) => {
                         return Err(PitruckError::RuntimeError {
                             line: *line,
-                            message: format!("'{name}' is already declared"),
+                            message: format!("'{name}' is already declared in this scope"),
                         });
                     }
                     Entry::Vacant(e) => { e.insert(v); }
@@ -283,7 +443,7 @@ impl Interpreter {
                     fields.borrow_mut().insert(name.clone(), val);
                     Ok(Signal::None)
                 } else {
-                    Err(PitruckError::RuntimeError { line: *line, message: "only instances have properties".to_string() })
+                    Err(PitruckError::RuntimeError { line: *line, message: format!("cannot set property '{name}' on a non-instance value") })
                 }
             }
             Stmt::IndexSet { object, index, value, line } => {
@@ -295,12 +455,8 @@ impl Interpreter {
                         if let Value::Number(n) = idx {
                             let i = n as usize;
                             let mut l = list.borrow_mut();
-                            if i < l.len() {
-                                l[i] = val;
-                                Ok(Signal::None)
-                            } else {
-                                Err(PitruckError::RuntimeError { line: *line, message: "index out of bounds".to_string() })
-                            }
+                            if i < l.len() { l[i] = val; Ok(Signal::None) }
+                            else { Err(PitruckError::RuntimeError { line: *line, message: format!("list index {i} out of bounds (len {})", l.len()) }) }
                         } else {
                             Err(PitruckError::RuntimeError { line: *line, message: "list index must be a number".to_string() })
                         }
@@ -317,18 +473,17 @@ impl Interpreter {
                 }
             }
             Stmt::Bring { module, line } => {
-                if self.loaded_modules.contains(module) {
-                    return Ok(Signal::None);
-                }
+                if self.loaded_modules.contains(module) { return Ok(Signal::None); }
                 let path = format!("lib/{}.pr", module);
                 let source = fs::read_to_string(&path).map_err(|_| PitruckError::RuntimeError {
-                    line: *line, message: format!("could not bring module '{module}'")
+                    line: *line,
+                    message: format!("could not bring module '{module}' — looked at '{path}'"),
                 })?;
                 self.loaded_modules.insert(module.clone());
-                let mut lexer = crate::lexer::Lexer::new(&source);
-                let tokens = lexer.tokenize()?;
+                let mut lexer  = crate::lexer::Lexer::new(&source);
+                let tokens     = lexer.tokenize()?;
                 let mut parser = crate::parser::Parser::new(tokens);
-                let program = parser.parse_program()?;
+                let program    = parser.parse_program()?;
                 self.run(&program)?;
                 Ok(Signal::None)
             }
@@ -359,9 +514,7 @@ impl Interpreter {
                         return self.exec_block(elif_body);
                     }
                 }
-                if let Some(eb) = else_branch {
-                    return self.exec_block(eb);
-                }
+                if let Some(eb) = else_branch { return self.exec_block(eb); }
                 Ok(Signal::None)
             }
             Stmt::While { condition, body, .. } => {
@@ -381,7 +534,7 @@ impl Interpreter {
                         for s in body {
                             match self.exec_stmt(s)? {
                                 Signal::Return(v) => return Ok(Signal::Return(v)),
-                                Signal::None => {}
+                                Signal::None      => {}
                             }
                         }
                         return Ok(Signal::None);
@@ -391,7 +544,7 @@ impl Interpreter {
                     for s in def_body {
                         match self.exec_stmt(s)? {
                             Signal::Return(v) => return Ok(Signal::Return(v)),
-                            Signal::None => {}
+                            Signal::None      => {}
                         }
                     }
                 }
@@ -440,9 +593,7 @@ impl Interpreter {
 
             Expr::List { elements, .. } => {
                 let mut vec = Vec::with_capacity(elements.len());
-                for e in elements {
-                    vec.push(self.eval_expr(e)?);
-                }
+                for e in elements { vec.push(self.eval_expr(e)?); }
                 Ok(Value::List(Rc::new(RefCell::new(vec))))
             }
 
@@ -453,7 +604,7 @@ impl Interpreter {
                     if let Value::Str(s) = k_val {
                         map.insert(s, self.eval_expr(v)?);
                     } else {
-                        return Err(PitruckError::RuntimeError { line: *line, message: "dict key must be string".to_string() });
+                        return Err(PitruckError::RuntimeError { line: *line, message: "dict key must be a string".to_string() });
                     }
                 }
                 Ok(Value::Dict(Rc::new(RefCell::new(map))))
@@ -462,18 +613,16 @@ impl Interpreter {
             Expr::Get { object, name, line } => {
                 let obj = self.eval_expr(object)?;
                 if let Value::Instance { fields, methods, .. } = &obj {
-                    if let Some(val) = fields.borrow().get(name) {
-                        return Ok(val.clone());
-                    }
+                    if let Some(val) = fields.borrow().get(name) { return Ok(val.clone()); }
                     if let Some(method) = methods.get(name) {
                         return Ok(Value::BoundMethod {
                             receiver: Box::new(obj.clone()),
-                            method: Box::new(method.clone()),
+                            method:   Box::new(method.clone()),
                         });
                     }
-                    return Err(PitruckError::RuntimeError { line: *line, message: format!("property '{}' not found", name) });
+                    return Err(PitruckError::RuntimeError { line: *line, message: format!("property '{name}' not found on instance") });
                 }
-                Err(PitruckError::RuntimeError { line: *line, message: "only instances have properties".to_string() })
+                Err(PitruckError::RuntimeError { line: *line, message: format!("cannot access property '{name}' on a non-instance value") })
             }
 
             Expr::IndexGet { object, index, line } => {
@@ -484,11 +633,8 @@ impl Interpreter {
                         if let Value::Number(n) = idx {
                             let i = n as usize;
                             let l = list.borrow();
-                            if i < l.len() {
-                                Ok(l[i].clone())
-                            } else {
-                                Err(PitruckError::RuntimeError { line: *line, message: "index out of bounds".to_string() })
-                            }
+                            if i < l.len() { Ok(l[i].clone()) }
+                            else { Err(PitruckError::RuntimeError { line: *line, message: format!("list index {i} out of bounds (len {})", l.len()) }) }
                         } else {
                             Err(PitruckError::RuntimeError { line: *line, message: "list index must be a number".to_string() })
                         }
@@ -509,7 +655,7 @@ impl Interpreter {
                 match op {
                     UnaryOpKind::Neg => match val {
                         Value::Number(n) => Ok(Value::Number(-n)),
-                        _ => Err(PitruckError::RuntimeError { line: *line, message: "'-' requires number".to_string() }),
+                        _ => Err(PitruckError::RuntimeError { line: *line, message: "unary '-' requires a number".to_string() }),
                     },
                     UnaryOpKind::Not => Ok(Value::Bool(!val.is_truthy())),
                 }
@@ -531,9 +677,7 @@ impl Interpreter {
 
             Expr::Call { callee, args, line } => {
                 let mut evaluated_args = Vec::with_capacity(args.len());
-                for a in args {
-                    evaluated_args.push(self.eval_expr(a)?);
-                }
+                for a in args { evaluated_args.push(self.eval_expr(a)?); }
 
                 if let Expr::Ident { name, .. } = &**callee {
                     if let Some(result) = self.call_builtin(name, &evaluated_args, *line) {
@@ -548,41 +692,34 @@ impl Interpreter {
                         if evaluated_args.len() != params.len() {
                             return Err(PitruckError::RuntimeError {
                                 line: *line,
-                                message: format!("expected {} args", params.len()),
+                                message: format!("expected {} arg(s), got {}", params.len(), evaluated_args.len()),
                             });
                         }
                         self.push_scope();
-                        for (p, arg) in params.iter().zip(evaluated_args) {
-                            self.define(p, arg);
-                        }
-                        let mut ret_val = Value::Null;
+                        for (p, arg) in params.iter().zip(evaluated_args) { self.define(p, arg); }
+                        let mut ret = Value::Null;
                         for s in body.iter() {
-                            if let Signal::Return(v) = self.exec_stmt(s)? {
-                                ret_val = v;
-                                break;
-                            }
+                            if let Signal::Return(v) = self.exec_stmt(s)? { ret = v; break; }
                         }
                         self.pop_scope();
-                        Ok(ret_val)
+                        Ok(ret)
                     }
                     Value::Class { name, methods } => {
                         let instance = Value::Instance {
                             class_name: name.clone(),
-                            fields: Rc::new(RefCell::new(HashMap::new())),
-                            methods: methods.clone(),
+                            fields:     Rc::new(RefCell::new(HashMap::new())),
+                            methods:    methods.clone(),
                         };
                         if let Some(Value::Function { params, body, .. }) = methods.get("init") {
                             if evaluated_args.len() != params.len() {
                                 return Err(PitruckError::RuntimeError {
                                     line: *line,
-                                    message: format!("init expected {} args", params.len()),
+                                    message: format!("{name}.init expected {} arg(s), got {}", params.len(), evaluated_args.len()),
                                 });
                             }
                             self.push_scope();
                             self.define("self", instance.clone());
-                            for (p, arg) in params.iter().zip(evaluated_args) {
-                                self.define(p, arg);
-                            }
+                            for (p, arg) in params.iter().zip(evaluated_args) { self.define(p, arg); }
                             for s in body.iter() {
                                 if let Signal::Return(_) = self.exec_stmt(s)? { break; }
                             }
@@ -590,7 +727,7 @@ impl Interpreter {
                         } else if !evaluated_args.is_empty() {
                             return Err(PitruckError::RuntimeError {
                                 line: *line,
-                                message: "class has no init method, but arguments provided".to_string(),
+                                message: format!("{name} has no init, but {} argument(s) were passed", evaluated_args.len()),
                             });
                         }
                         Ok(instance)
@@ -600,28 +737,23 @@ impl Interpreter {
                             if evaluated_args.len() != params.len() {
                                 return Err(PitruckError::RuntimeError {
                                     line: *line,
-                                    message: format!("expected {} args", params.len()),
+                                    message: format!("expected {} arg(s), got {}", params.len(), evaluated_args.len()),
                                 });
                             }
                             self.push_scope();
                             self.define("self", *receiver);
-                            for (p, arg) in params.iter().zip(evaluated_args) {
-                                self.define(p, arg);
-                            }
-                            let mut ret_val = Value::Null;
+                            for (p, arg) in params.iter().zip(evaluated_args) { self.define(p, arg); }
+                            let mut ret = Value::Null;
                             for s in body.iter() {
-                                if let Signal::Return(v) = self.exec_stmt(s)? {
-                                    ret_val = v;
-                                    break;
-                                }
+                                if let Signal::Return(v) = self.exec_stmt(s)? { ret = v; break; }
                             }
                             self.pop_scope();
-                            Ok(ret_val)
+                            Ok(ret)
                         } else {
                             Err(PitruckError::RuntimeError { line: *line, message: "invalid bound method".to_string() })
                         }
                     }
-                    _ => Err(PitruckError::RuntimeError { line: *line, message: "callable is not a function or class".to_string() })
+                    _ => Err(PitruckError::RuntimeError { line: *line, message: "value is not callable (expected function or class)".to_string() })
                 }
             }
         }
@@ -661,7 +793,7 @@ impl Interpreter {
             BinOpKind::Gt    => self.compare_nums(l, r, line, |a, b| a > b),
             BinOpKind::LtEq  => self.compare_nums(l, r, line, |a, b| a <= b),
             BinOpKind::GtEq  => self.compare_nums(l, r, line, |a, b| a >= b),
-            BinOpKind::And | BinOpKind::Or => unreachable!("And/Or handled in eval_expr"),
+            BinOpKind::And | BinOpKind::Or => unreachable!("And/Or short-circuit in eval_expr"),
         }
     }
 
@@ -677,15 +809,10 @@ impl Interpreter {
     }
 
     fn compare_nums<F>(&self, l: Value, r: Value, line: usize, cmp: F) -> Result<Value, PitruckError>
-    where
-        F: Fn(f64, f64) -> bool,
-    {
+    where F: Fn(f64, f64) -> bool {
         match (l, r) {
             (Value::Number(a), Value::Number(b)) => Ok(Value::Bool(cmp(a, b))),
-            _ => Err(PitruckError::RuntimeError {
-                line,
-                message: "comparison requires numbers".to_string(),
-            }),
+            _ => Err(PitruckError::RuntimeError { line, message: "comparison requires numbers".to_string() }),
         }
     }
 }

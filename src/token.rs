@@ -48,9 +48,5 @@ pub enum Token {
     Colon,
     Underscore,
 
-    Newline,
-    Indent,
-    Dedent,
-
     EOF,
 }
