@@ -55,7 +55,6 @@ fn run_source(source: &str, show_perf: bool) -> bool {
     ok
 }
 
-// Parse a raw query string like "name=alice&page=2" into a Pitruck dict literal source fragment.
 fn query_to_pitruck_dict(query: &str) -> String {
     if query.is_empty() {
         return "{}".to_string();
@@ -73,7 +72,6 @@ fn query_to_pitruck_dict(query: &str) -> String {
     format!("{{{}}}", pairs.join(", "))
 }
 
-// Parse raw HTTP headers into a Pitruck dict literal source fragment.
 fn headers_to_pitruck_dict(headers: &[String]) -> String {
     let pairs: Vec<String> = headers
         .iter()
@@ -99,7 +97,6 @@ fn serve_request(
     let query_dict   = query_to_pitruck_dict(query);
     let headers_dict = headers_to_pitruck_dict(headers);
 
-    // Inject structured request/response objects before user code runs.
     let preamble = format!(
         r#"
 class __Request {{
@@ -216,8 +213,6 @@ fn repl() {
     }
 }
 
-// Read a full HTTP request from a TCP stream, handling chunked/slow clients by
-// reading until we have all headers and the declared Content-Length body bytes.
 fn read_http_request(stream: &mut std::net::TcpStream) -> String {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -228,11 +223,10 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
 
-                // Stop once we have the full body (headers + content-length bytes).
                 if let Some(header_end) = find_header_end(&buf) {
                     let header_str = String::from_utf8_lossy(&buf[..header_end]);
                     if let Some(len) = parse_content_length(&header_str) {
-                        let total = header_end + 4 + len; // +4 for \r\n\r\n
+                        let total = header_end + 4 + len; 
                         if buf.len() >= total { break; }
                     } else {
                         break;
@@ -266,7 +260,6 @@ fn main() {
         return;
     }
 
-    // Collect flags before dispatch.
     let debug     = args.contains(&"--debug".to_string());
     let show_perf = args.contains(&"--speed".to_string());
 
@@ -347,7 +340,6 @@ fn main() {
                 }
                 let body: String = lines.collect::<Vec<_>>().join("\n").trim_matches('\0').to_string();
 
-                // Resolve the handler source: single file or file-based routing.
                 let source = if is_dir {
                     let candidate = format!("{}{}.pr", target.trim_end_matches('/'), route);
                     let fallback  = format!("{}/index.pr", target.trim_end_matches('/'));

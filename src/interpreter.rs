@@ -20,7 +20,6 @@ pub struct Interpreter {
     rand_seed:       u64,
     loaded_modules:  HashSet<String>,
 
-    // When true, file I/O builtins are blocked (used in --serve mode).
     sandboxed:       bool,
 }
 
@@ -45,8 +44,6 @@ impl Interpreter {
         self.sandboxed = v;
     }
 
-    // --- Readers used by main.rs to extract response state after execution ---
-
     pub fn read_number(&self, name: &str) -> Option<f64> {
         for scope in self.scopes.iter().rev() {
             if let Some(Value::Number(n)) = scope.get(name) { return Some(*n); }
@@ -65,7 +62,6 @@ impl Interpreter {
         None
     }
 
-    // Read response.status from the structured __Response instance.
     pub fn read_response_status(&self) -> Option<f64> {
         let inst = self.get_instance("response")?;
         let fields = inst.borrow();
@@ -75,7 +71,6 @@ impl Interpreter {
         }
     }
 
-    // Read response.body from the structured __Response instance.
     pub fn read_response_body(&self) -> Option<String> {
         let inst = self.get_instance("response")?;
         let fields = inst.borrow();
@@ -86,7 +81,6 @@ impl Interpreter {
         }
     }
 
-    // Read response.headers (a dict) from the structured __Response instance.
     pub fn read_response_headers(&self) -> Vec<(String, String)> {
         let inst = match self.get_instance("response") {
             Some(i) => i,
@@ -171,7 +165,6 @@ impl Interpreter {
                 };
                 Some(Ok(Value::Bool(ok)))
             }
-            // Escape a string for safe HTML output, preventing XSS in templates.
             "html_escape" => {
                 if args.len() != 1 { return Some(Err(arity_err(1))); }
                 let s = format!("{}", args[0]);
