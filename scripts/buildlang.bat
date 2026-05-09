@@ -13,4 +13,5 @@ IF NOT EXIST "Cargo.toml" (
     ) > Cargo.toml
 )
 
+set RUSTFLAGS=-Awarnings
 cargo build --release --quiet
