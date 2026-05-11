@@ -1,6 +1,7 @@
 use crate::token::Token;
 use crate::ast::*;
 use crate::error::PitruckError;
+use crate::symbol::hash_name;
 
 pub struct Parser {
     tokens: Vec<(Token, usize, usize)>,
@@ -78,9 +79,10 @@ impl Parser {
             Token::Var => {
                 self.advance();
                 let name  = self.expect_ident()?;
+                let hash  = hash_name(&name);
                 self.expect(&Token::Eq)?;
                 let value = self.parse_expr()?;
-                Ok(Stmt::VarDecl { name, value, line })
+                Ok(Stmt::VarDecl { name, hash, value, line })
             }
             Token::Bring => {
                 self.advance();
@@ -157,10 +159,11 @@ impl Parser {
             Token::For => {
                 self.advance();
                 let var = self.expect_ident()?;
+                let var_hash = hash_name(&var);
                 self.expect(&Token::In)?;
                 let iter = self.parse_expr()?;
                 let body = self.parse_body()?;
-                Ok(Stmt::For { var, iter, body, line })
+                Ok(Stmt::For { var, var_hash, iter, body, line })
             }
             _ => {
                 let expr = self.parse_expr()?;
@@ -168,7 +171,7 @@ impl Parser {
                     self.advance();
                     let value = self.parse_expr()?;
                     match expr {
-                        Expr::Ident { name, line }             => Ok(Stmt::Assign { name, value, line }),
+                        Expr::Ident { name, hash, line }       => Ok(Stmt::Assign { name, hash, value, line }),
                         Expr::Get { object, name, line }       => Ok(Stmt::Set { object: *object, name, value, line }),
                         Expr::IndexGet { object, index, line } => Ok(Stmt::IndexSet { object: *object, index: *index, value, line }),
                         _ => Err(PitruckError::ParseError { line, col, message: "invalid assignment target".to_string() }),
@@ -204,14 +207,18 @@ impl Parser {
         Ok(Stmt::If { condition, then_branch, elif_branches, else_branch, line })
     }
 
-    fn parse_params(&mut self) -> Result<Vec<String>, PitruckError> {
+    fn parse_params(&mut self) -> Result<Vec<(String, u64)>, PitruckError> {
         let mut params = Vec::new();
         if matches!(self.peek(), Token::RParen) { return Ok(params); }
-        params.push(self.expect_ident()?);
+        let name = self.expect_ident()?;
+        let hash = hash_name(&name);
+        params.push((name, hash));
         while matches!(self.peek(), Token::Comma) {
             self.advance();
             if matches!(self.peek(), Token::RParen) { break; }
-            params.push(self.expect_ident()?);
+            let name = self.expect_ident()?;
+            let hash = hash_name(&name);
+            params.push((name, hash));
         }
         Ok(params)
     }
@@ -391,7 +398,7 @@ impl Parser {
             Token::False        => { self.advance(); Ok(Expr::Bool(false)) }
             Token::Null         => { self.advance(); Ok(Expr::Null) }
             Token::Self_        => { self.advance(); Ok(Expr::Self_ { line }) }
-            Token::Ident(name)  => { self.advance(); Ok(Expr::Ident { name, line }) }
+            Token::Ident(name)  => { self.advance(); let hash = hash_name(&name); Ok(Expr::Ident { name, hash, line }) }
             Token::LParen => {
                 self.advance();
                 let expr = self.parse_expr()?;

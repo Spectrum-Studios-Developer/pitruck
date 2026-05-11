@@ -5,6 +5,7 @@ mod lexer;
 mod parser;
 mod value;
 mod interpreter;
+mod symbol;
 
 use std::env;
 use std::fs;

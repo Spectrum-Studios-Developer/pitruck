@@ -14,7 +14,7 @@ pub enum Signal {
 }
 
 pub struct Interpreter {
-    vars: Vec<(String, Value)>,
+    vars: Vec<(u64, Value)>,
     scope_tops: Vec<usize>,
     start:          Instant,
     rand_seed:      u64,
@@ -26,9 +26,10 @@ pub struct Interpreter {
 
 impl Interpreter {
     pub fn new() -> Self {
+        use crate::symbol::hash_name;
         let mut vars = Vec::with_capacity(256);
-        vars.push(("PI".to_string(), Value::Number(std::f64::consts::PI)));
-        vars.push(("E".to_string(),  Value::Number(std::f64::consts::E)));
+        vars.push((hash_name("PI"), Value::Number(std::f64::consts::PI)));
+        vars.push((hash_name("E"),  Value::Number(std::f64::consts::E)));
         Interpreter {
             vars,
             scope_tops: vec![0],
@@ -105,8 +106,9 @@ impl Interpreter {
     }
 
     pub fn read_number(&self, name: &str) -> Option<f64> {
+        let hash = crate::symbol::hash_name(name);
         for (k, v) in self.vars.iter().rev() {
-            if k == name {
+            if *k == hash {
                 if let Value::Number(n) = v { return Some(*n); }
             }
         }
@@ -114,8 +116,9 @@ impl Interpreter {
     }
 
     pub fn read_string(&self, name: &str) -> Option<String> {
+        let hash = crate::symbol::hash_name(name);
         for (k, v) in self.vars.iter().rev() {
-            if k == name {
+            if *k == hash {
                 return Some(match v {
                     Value::Str(s) => s.clone(),
                     other         => format!("{}", other),
@@ -159,8 +162,9 @@ impl Interpreter {
     }
 
     fn get_instance(&self, name: &str) -> Option<Rc<RefCell<HashMap<String, Value>>>> {
+        let hash = crate::symbol::hash_name(name);
         for (k, v) in self.vars.iter().rev() {
-            if k == name {
+            if *k == hash {
                 if let Value::Instance { fields, .. } = v {
                     return Some(fields.clone());
                 }
@@ -542,13 +546,18 @@ impl Interpreter {
     }
 
     #[inline]
-    fn define(&mut self, name: &str, val: Value) {
-        self.vars.push((name.to_string(), val));
+    fn define_hash(&mut self, hash: u64, val: Value) {
+        self.vars.push((hash, val));
     }
 
-    fn assign(&mut self, name: &str, val: Value, line: usize) -> Result<(), PitruckError> {
+    #[inline]
+    fn define(&mut self, name: &str, val: Value) {
+        self.vars.push((crate::symbol::hash_name(name), val));
+    }
+
+    fn assign_hash(&mut self, hash: u64, name: &str, val: Value, line: usize) -> Result<(), PitruckError> {
         for (k, v) in self.vars.iter_mut().rev() {
-            if k == name {
+            if *k == hash {
                 *v = val;
                 return Ok(());
             }
@@ -556,11 +565,19 @@ impl Interpreter {
         Err(PitruckError::RuntimeError { line, message: format!("undefined variable '{name}' -- did you mean to use 'var'?") })
     }
 
-    fn lookup(&self, name: &str, line: usize) -> Result<Value, PitruckError> {
+    fn assign(&mut self, name: &str, val: Value, line: usize) -> Result<(), PitruckError> {
+        self.assign_hash(crate::symbol::hash_name(name), name, val, line)
+    }
+
+    fn lookup_hash(&self, hash: u64, name: &str, line: usize) -> Result<Value, PitruckError> {
         for (k, v) in self.vars.iter().rev() {
-            if k == name { return Ok(v.clone()); }
+            if *k == hash { return Ok(v.clone()); }
         }
         Err(PitruckError::RuntimeError { line, message: format!("undefined variable '{name}'") })
+    }
+
+    fn lookup(&self, name: &str, line: usize) -> Result<Value, PitruckError> {
+        self.lookup_hash(crate::symbol::hash_name(name), name, line)
     }
 
     #[inline]
@@ -574,23 +591,23 @@ impl Interpreter {
 
     fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Signal, PitruckError> {
         match stmt {
-            Stmt::VarDecl { name, value, line } => {
+            Stmt::VarDecl { name, hash, value, line } => {
                 let v = self.eval_expr(value)?;
                 let scope_start = *self.scope_tops.last().unwrap_or(&0);
                 for (k, _) in self.vars[scope_start..].iter() {
-                    if k == name {
+                    if *k == *hash {
                         return Err(PitruckError::RuntimeError {
                             line: *line,
                             message: format!("'{name}' is already declared in this scope"),
                         });
                     }
                 }
-                self.vars.push((name.to_string(), v));
+                self.vars.push((*hash, v));
                 Ok(Signal::None)
             }
-            Stmt::Assign { name, value, line } => {
+            Stmt::Assign { name, hash, value, line } => {
                 let v = self.eval_expr(value)?;
-                self.assign(name, v, *line)?;
+                self.assign_hash(*hash, name, v, *line)?;
                 Ok(Signal::None)
             }
             Stmt::Set { object, name, value, line } => {
@@ -718,7 +735,7 @@ impl Interpreter {
                 }
                 Ok(Signal::None)
             }
-            Stmt::For { var, iter, body, line } => {
+            Stmt::For { var, var_hash, iter, body, line } => {
                 let iterable = self.eval_expr(iter)?;
                 let items = match iterable {
                     Value::List(l) => l.borrow().clone(),
@@ -730,7 +747,7 @@ impl Interpreter {
                 };
                 for item in items {
                     self.push_scope();
-                    self.define(var, item);
+                    self.define_hash(*var_hash, item);
                     let sig = self.exec_block_in_current_scope(body)?;
                     self.pop_scope();
                     if let Signal::Return(v) = sig {
@@ -803,8 +820,8 @@ impl Interpreter {
             Expr::StringLit(s) => Ok(Value::Str(s.clone())),
             Expr::Bool(b)      => Ok(Value::Bool(*b)),
             Expr::Null         => Ok(Value::Null),
-            Expr::Ident { name, line } => self.lookup(name, *line),
-            Expr::Self_ { line }       => self.lookup("self", *line),
+            Expr::Ident { name, hash, line } => self.lookup_hash(*hash, name, *line),
+            Expr::Self_ { line }             => self.lookup_hash(crate::symbol::hash_name("self"), "self", *line),
 
             Expr::Lambda { params, body, .. } => {
                 Ok(Value::Function { name: "<lambda>".to_string(), params: Rc::new(params.clone()), body: Rc::new(body.clone()) })
@@ -932,7 +949,7 @@ impl Interpreter {
                             });
                         }
                         self.push_scope();
-                        for (p, arg) in params.iter().zip(evaluated_args) { self.define(p, arg); }
+                        for ((p, ph), arg) in params.iter().zip(evaluated_args) { self.define_hash(*ph, arg); }
                         let mut ret = Value::Null;
                         'call: for s in body.iter() {
                             if let Signal::Return(v) = self.exec_stmt(s)? { ret = v; break 'call; }
@@ -957,7 +974,7 @@ impl Interpreter {
                             }
                             self.push_scope();
                             self.define("self", instance.clone());
-                            for (p, arg) in params.iter().zip(evaluated_args) { self.define(p, arg); }
+                            for ((p, ph), arg) in params.iter().zip(evaluated_args) { self.define_hash(*ph, arg); }
                             for s in body.iter() {
                                 if let Signal::Return(_) = self.exec_stmt(s)? { break; }
                             }
@@ -981,7 +998,7 @@ impl Interpreter {
                             }
                             self.push_scope();
                             self.define("self", *receiver);
-                            for (p, arg) in params.iter().zip(evaluated_args) { self.define(p, arg); }
+                            for ((p, ph), arg) in params.iter().zip(evaluated_args) { self.define_hash(*ph, arg); }
                             let mut ret = Value::Null;
                             for s in body.iter() {
                                 if let Signal::Return(v) = self.exec_stmt(s)? { ret = v; break; }
