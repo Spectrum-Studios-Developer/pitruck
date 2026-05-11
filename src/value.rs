@@ -10,7 +10,7 @@ pub enum Value {
     Str(String),
     Bool(bool),
     Null,
-    Function { name: String, params: Vec<String>, body: Vec<Stmt> },
+    Function { name: String, params: Rc<Vec<String>>, body: Rc<Vec<Stmt>> },
     List(Rc<RefCell<Vec<Value>>>),
     Dict(Rc<RefCell<HashMap<String, Value>>>),
     Class { name: String, methods: HashMap<String, Value> },

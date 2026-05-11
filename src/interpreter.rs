@@ -2,33 +2,53 @@ use crate::ast::*;
 use crate::value::Value;
 use crate::error::PitruckError;
 use std::collections::{HashMap, HashSet};
-use std::collections::hash_map::Entry;
 use std::io::{self, Write, BufRead};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::fs;
+use std::path::{Path, PathBuf};
 
+thread_local! {
+    static STRING_POOL: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new());
+}
+
+#[inline]
+fn intern(s: &str) -> String {
+    STRING_POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        if let Some(existing) = p.get(s) {
+            return existing.clone();
+        }
+        p.insert(s.to_string());
+        s.to_string()
+    })
+}
 pub enum Signal {
     None,
     Return(Value),
 }
 
 pub struct Interpreter {
-    scopes:         Vec<HashMap<String, Value>>,
+    vars: Vec<(String, Value)>,
+    scope_tops: Vec<usize>,
     start:          Instant,
     rand_seed:      u64,
     loaded_modules: HashSet<String>,
     sandboxed:      bool,
+    script_dir:     Option<PathBuf>,
+    exe_dir:        Option<PathBuf>,
 }
 
 impl Interpreter {
     pub fn new() -> Self {
-        let mut globals = HashMap::new();
-        globals.insert("PI".to_string(), Value::Number(std::f64::consts::PI));
-        globals.insert("E".to_string(),  Value::Number(std::f64::consts::E));
+        let mut vars = Vec::with_capacity(256);
+        vars.push(("PI".to_string(), Value::Number(std::f64::consts::PI)));
+        vars.push(("E".to_string(),  Value::Number(std::f64::consts::E)));
         Interpreter {
-            scopes: vec![globals],
+            vars,
+            scope_tops: vec![0],
+            exe_dir: std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())),
             start:  Instant::now(),
             rand_seed: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -36,24 +56,86 @@ impl Interpreter {
                 .as_millis() as u64,
             loaded_modules: HashSet::new(),
             sandboxed: false,
+            script_dir: None,
         }
     }
 
     pub fn set_sandboxed(&mut self, v: bool) { self.sandboxed = v; }
 
+    pub fn set_script_path(&mut self, path: &str) {
+        let p = Path::new(path);
+        if let Some(dir) = p.parent() {
+            self.script_dir = Some(if dir.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                dir.to_path_buf()
+            });
+        }
+    }
+
+    fn resolve_module(&self, module: &str) -> Option<PathBuf> {
+        let candidates = self.module_candidates(module);
+        candidates.into_iter().find(|p| p.exists())
+    }
+
+    fn module_candidates(&self, module: &str) -> Vec<PathBuf> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        let names = if module.ends_with(".pr") {
+            vec![module.to_string()]
+        } else {
+            vec![format!("{}.pr", module), module.to_string()]
+        };
+
+        for name in &names {
+            let p = Path::new(name);
+
+            if p.is_absolute() {
+                candidates.push(p.to_path_buf());
+                continue;
+            }
+
+            if let Some(ref script_dir) = self.script_dir {
+                candidates.push(script_dir.join(name));
+                candidates.push(script_dir.join("lib").join(name));
+            }
+
+            candidates.push(PathBuf::from(name));
+            candidates.push(PathBuf::from("lib").join(name));
+
+            if let Some(ref exe_dir) = self.exe_dir {
+                candidates.push(exe_dir.join("lib").join(name));
+
+                let mut global = exe_dir.clone();
+                for _ in 0..3 {
+                    global = match global.parent() {
+                        Some(p) => p.to_path_buf(),
+                        None    => break,
+                    };
+                }
+                candidates.push(global.join("lib").join(name));
+            }
+        }
+
+        candidates
+    }
+
     pub fn read_number(&self, name: &str) -> Option<f64> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(Value::Number(n)) = scope.get(name) { return Some(*n); }
+        for (k, v) in self.vars.iter().rev() {
+            if k == name {
+                if let Value::Number(n) = v { return Some(*n); }
+            }
         }
         None
     }
 
     pub fn read_string(&self, name: &str) -> Option<String> {
-        for scope in self.scopes.iter().rev() {
-            match scope.get(name) {
-                Some(Value::Str(s)) => return Some(s.clone()),
-                Some(other)         => return Some(format!("{}", other)),
-                None                => {}
+        for (k, v) in self.vars.iter().rev() {
+            if k == name {
+                return Some(match v {
+                    Value::Str(s) => s.clone(),
+                    other         => format!("{}", other),
+                });
             }
         }
         None
@@ -93,9 +175,11 @@ impl Interpreter {
     }
 
     fn get_instance(&self, name: &str) -> Option<Rc<RefCell<HashMap<String, Value>>>> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(Value::Instance { fields, .. }) = scope.get(name) {
-                return Some(fields.clone());
+        for (k, v) in self.vars.iter().rev() {
+            if k == name {
+                if let Value::Instance { fields, .. } = v {
+                    return Some(fields.clone());
+                }
             }
         }
         None
@@ -475,43 +559,49 @@ impl Interpreter {
 
     #[inline]
     fn define(&mut self, name: &str, val: Value) {
-        self.scopes.last_mut().unwrap().insert(name.to_string(), val);
+        self.vars.push((name.to_string(), val));
     }
 
     fn assign(&mut self, name: &str, val: Value, line: usize) -> Result<(), PitruckError> {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(slot) = scope.get_mut(name) {
-                *slot = val;
+        for (k, v) in self.vars.iter_mut().rev() {
+            if k == name {
+                *v = val;
                 return Ok(());
             }
         }
-        Err(PitruckError::RuntimeError { line, message: format!("undefined variable '{name}' — did you mean to use 'var'?") })
+        Err(PitruckError::RuntimeError { line, message: format!("undefined variable '{name}' -- did you mean to use 'var'?") })
     }
 
     fn lookup(&self, name: &str, line: usize) -> Result<Value, PitruckError> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(v) = scope.get(name) { return Ok(v.clone()); }
+        for (k, v) in self.vars.iter().rev() {
+            if k == name { return Ok(v.clone()); }
         }
         Err(PitruckError::RuntimeError { line, message: format!("undefined variable '{name}'") })
     }
 
     #[inline]
-    fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
+        fn push_scope(&mut self) { self.scope_tops.push(self.vars.len()); }
 
-    #[inline]
-    fn pop_scope(&mut self) { self.scopes.pop(); }
+        #[inline]
+        fn pop_scope(&mut self) {
+            let top = self.scope_tops.pop().unwrap_or(0);
+            self.vars.truncate(top);
+        }
 
     fn exec_stmt(&mut self, stmt: &Stmt) -> Result<Signal, PitruckError> {
         match stmt {
             Stmt::VarDecl { name, value, line } => {
                 let v = self.eval_expr(value)?;
-                match self.scopes.last_mut().unwrap().entry(name.to_string()) {
-                    Entry::Occupied(_) => return Err(PitruckError::RuntimeError {
-                        line: *line,
-                        message: format!("'{name}' is already declared in this scope"),
-                    }),
-                    Entry::Vacant(e) => { e.insert(v); }
+                let scope_start = *self.scope_tops.last().unwrap_or(&0);
+                for (k, _) in self.vars[scope_start..].iter() {
+                    if k == name {
+                        return Err(PitruckError::RuntimeError {
+                            line: *line,
+                            message: format!("'{name}' is already declared in this scope"),
+                        });
+                    }
                 }
+                self.vars.push((name.to_string(), v));
                 Ok(Signal::None)
             }
             Stmt::Assign { name, value, line } => {
@@ -561,22 +651,52 @@ impl Interpreter {
                 }
             }
             Stmt::Bring { module, line } => {
-                if self.loaded_modules.contains(module) { return Ok(Signal::None); }
-                let path = format!("lib/{}.pr", module);
-                let source = fs::read_to_string(&path).map_err(|_| PitruckError::RuntimeError {
-                    line: *line,
-                    message: format!("could not bring module '{module}' — looked at '{path}'"),
+                let cache_key = module.clone();
+                if self.loaded_modules.contains(&cache_key) { return Ok(Signal::None); }
+
+                let resolved = self.resolve_module(module).ok_or_else(|| {
+                    let searched = self.module_candidates(module)
+                        .into_iter()
+                        .map(|p| format!("  {}", p.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    PitruckError::RuntimeError {
+                        line: *line,
+                        message: format!(
+                            "could not bring module '{}' - searched:\n{}",
+                            module, searched
+                        ),
+                    }
                 })?;
-                self.loaded_modules.insert(module.clone());
+
+                let source = fs::read_to_string(&resolved).map_err(|e| PitruckError::RuntimeError {
+                    line: *line,
+                    message: format!("could not read module '{}': {}", resolved.display(), e),
+                })?;
+
+                self.loaded_modules.insert(cache_key);
+
+                let saved_script_dir = self.script_dir.clone();
+                if let Some(parent) = resolved.parent() {
+                    self.script_dir = Some(if parent.as_os_str().is_empty() {
+                        PathBuf::from(".")
+                    } else {
+                        parent.to_path_buf()
+                    });
+                }
+
                 let mut lexer  = crate::lexer::Lexer::new(&source);
                 let tokens     = lexer.tokenize()?;
                 let mut parser = crate::parser::Parser::new(tokens);
                 let program    = parser.parse_program()?;
                 self.run(&program)?;
+
+                self.script_dir = saved_script_dir;
+
                 Ok(Signal::None)
             }
             Stmt::FuncDef { name, params, body, .. } => {
-                let func = Value::Function { name: name.clone(), params: params.clone(), body: body.clone() };
+                let func = Value::Function { name: name.clone(), params: Rc::new(params.clone()), body: Rc::new(body.clone()) };
                 self.define(name, func);
                 Ok(Signal::None)
             }
@@ -586,7 +706,7 @@ impl Interpreter {
                     if let Stmt::FuncDef { name: mname, params, body, .. } = m {
                         method_map.insert(
                             mname.clone(),
-                            Value::Function { name: mname.clone(), params: params.clone(), body: body.clone() },
+                            Value::Function { name: mname.clone(), params: Rc::new(params.clone()), body: Rc::new(body.clone()) },
                         );
                     }
                 }
@@ -681,7 +801,7 @@ impl Interpreter {
         self.pop_scope();
         result
     }
-    
+
     fn exec_block_in_current_scope(&mut self, stmts: &[Stmt]) -> Result<Signal, PitruckError> {
         for s in stmts {
             if let Signal::Return(v) = self.exec_stmt(s)? {
@@ -701,7 +821,7 @@ impl Interpreter {
             Expr::Self_ { line }       => self.lookup("self", *line),
 
             Expr::Lambda { params, body, .. } => {
-                Ok(Value::Function { name: "<lambda>".to_string(), params: params.clone(), body: body.clone() })
+                Ok(Value::Function { name: "<lambda>".to_string(), params: Rc::new(params.clone()), body: Rc::new(body.clone()) })
             }
 
             Expr::List { elements, .. } => {
@@ -805,7 +925,7 @@ impl Interpreter {
             Expr::Call { callee, args, line } => {
                 let mut evaluated_args = Vec::with_capacity(args.len());
                 for a in args { evaluated_args.push(self.eval_expr(a)?); }
-                
+
                 if let Expr::Ident { name, .. } = &**callee {
                     if let Some(result) = self.call_builtin(name, &evaluated_args, *line) {
                         return result;
@@ -816,6 +936,8 @@ impl Interpreter {
 
                 match callee_val {
                     Value::Function { params, body, .. } => {
+                        let params = (*params).clone();
+                        let body = body.clone();
                         if evaluated_args.len() != params.len() {
                             return Err(PitruckError::RuntimeError {
                                 line: *line,
@@ -825,8 +947,8 @@ impl Interpreter {
                         self.push_scope();
                         for (p, arg) in params.iter().zip(evaluated_args) { self.define(p, arg); }
                         let mut ret = Value::Null;
-                        for s in body.iter() {
-                            if let Signal::Return(v) = self.exec_stmt(s)? { ret = v; break; }
+                        'call: for s in body.iter() {
+                            if let Signal::Return(v) = self.exec_stmt(s)? { ret = v; break 'call; }
                         }
                         self.pop_scope();
                         Ok(ret)
@@ -839,6 +961,8 @@ impl Interpreter {
                             methods: methods.clone(),
                         };
                         if let Some(Value::Function { params, body, .. }) = methods.get("init") {
+                            let params = (**params).clone();
+                            let body = body.clone();
                             if evaluated_args.len() != params.len() {
                                 return Err(PitruckError::RuntimeError {
                                     line: *line,

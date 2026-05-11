@@ -15,7 +15,7 @@ use lexer::Lexer;
 use parser::Parser;
 use interpreter::Interpreter;
 
-fn run_source(source: &str, show_perf: bool) -> bool {
+fn run_source(source: &str, script_path: Option<&str>, show_perf: bool) -> bool {
     let total = Instant::now();
 
     let t0 = Instant::now();
@@ -36,6 +36,9 @@ fn run_source(source: &str, show_perf: bool) -> bool {
 
     let t2 = Instant::now();
     let mut vm = Interpreter::new();
+    if let Some(path) = script_path {
+        vm.set_script_path(path);
+    }
     let ok = match vm.run(&program) {
         Ok(_)  => true,
         Err(e) => { eprintln!("{e}"); false }
@@ -87,6 +90,7 @@ fn headers_to_pitruck_dict(headers: &[String]) -> String {
 
 fn serve_request(
     source: &str,
+    script_path: Option<&str>,
     method: &str,
     path: &str,
     query: &str,
@@ -149,6 +153,9 @@ var response = __Response()
     };
 
     let mut vm = Interpreter::new();
+    if let Some(sp) = script_path {
+        vm.set_script_path(sp);
+    }
     if let Err(e) = vm.run(&program) {
         if debug { eprintln!("[pitruck] runtime error: {e}"); }
         return (500, format!("<pre>Runtime Error\n{e}</pre>"), vec![]);
@@ -340,22 +347,30 @@ fn main() {
                 }
                 let body: String = lines.collect::<Vec<_>>().join("\n").trim_matches('\0').to_string();
 
-                let source = if is_dir {
+                let (source, script_path) = if is_dir {
                     let candidate = format!("{}{}.pr", target.trim_end_matches('/'), route);
                     let fallback  = format!("{}/index.pr", target.trim_end_matches('/'));
-                    fs::read_to_string(&candidate)
-                        .or_else(|_| fs::read_to_string(&fallback))
-                        .unwrap_or_else(|_| "response.status = 404\nresponse.body = \"404 Not Found\"".to_string())
+                    if std::path::Path::new(&candidate).exists() {
+                        let src = fs::read_to_string(&candidate).unwrap_or_default();
+                        (src, candidate)
+                    } else if std::path::Path::new(&fallback).exists() {
+                        let src = fs::read_to_string(&fallback).unwrap_or_default();
+                        (src, fallback)
+                    } else {
+                        ("response.status = 404\nresponse.body = \"404 Not Found\"".to_string(), String::new())
+                    }
                 } else {
                     match fs::read_to_string(target) {
-                        Ok(s)  => s,
+                        Ok(s)  => (s, target.clone()),
                         Err(e) => { eprintln!("Cannot read '{}': {}", target, e); continue; }
                     }
                 };
 
+                let sp = if script_path.is_empty() { None } else { Some(script_path.as_str()) };
+
                 let t0 = Instant::now();
                 let (status_code, html, extra_headers) =
-                    serve_request(&source, &method, &route, &query, &body, &headers, debug);
+                    serve_request(&source, sp, &method, &route, &query, &body, &headers, debug);
                 let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
                 let status_text = match status_code {
@@ -474,7 +489,7 @@ fn main() {
                 Ok(s)  => s,
                 Err(e) => { eprintln!("Cannot read file '{path}': {e}"); std::process::exit(1); }
             };
-            if !run_source(&source, show_perf) {
+            if !run_source(&source, Some(path), show_perf) {
                 std::process::exit(1);
             }
         }
