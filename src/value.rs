@@ -65,6 +65,7 @@ impl fmt::Display for Value {
 }
 
 impl Value {
+    #[inline(always)]
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Bool(false) | Value::Null)
     }

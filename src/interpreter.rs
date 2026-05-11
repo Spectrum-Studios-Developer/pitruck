@@ -8,22 +8,6 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-thread_local! {
-    static STRING_POOL: RefCell<std::collections::HashSet<String>> = RefCell::new(std::collections::HashSet::new());
-}
-
-#[inline]
-fn intern(s: &str) -> String {
-    STRING_POOL.with(|pool| {
-        let mut p = pool.borrow_mut();
-        if let Some(existing) = p.get(s) {
-            return existing.clone();
-        }
-        p.insert(s.to_string());
-        s.to_string()
-    })
-}
 pub enum Signal {
     None,
     Return(Value),
@@ -796,12 +780,14 @@ impl Interpreter {
 
     #[inline]
     fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Signal, PitruckError> {
+        if stmts.is_empty() { return Ok(Signal::None); }
         self.push_scope();
         let result = self.exec_block_in_current_scope(stmts);
         self.pop_scope();
         result
     }
 
+    #[inline(always)]
     fn exec_block_in_current_scope(&mut self, stmts: &[Stmt]) -> Result<Signal, PitruckError> {
         for s in stmts {
             if let Signal::Return(v) = self.exec_stmt(s)? {
@@ -927,8 +913,10 @@ impl Interpreter {
                 for a in args { evaluated_args.push(self.eval_expr(a)?); }
 
                 if let Expr::Ident { name, .. } = &**callee {
-                    if let Some(result) = self.call_builtin(name, &evaluated_args, *line) {
-                        return result;
+                    if name.len() <= 16 {
+                        if let Some(result) = self.call_builtin(name, &evaluated_args, *line) {
+                            return result;
+                        }
                     }
                 }
 
@@ -936,7 +924,6 @@ impl Interpreter {
 
                 match callee_val {
                     Value::Function { params, body, .. } => {
-                        let params = (*params).clone();
                         let body = body.clone();
                         if evaluated_args.len() != params.len() {
                             return Err(PitruckError::RuntimeError {
@@ -961,7 +948,6 @@ impl Interpreter {
                             methods: methods.clone(),
                         };
                         if let Some(Value::Function { params, body, .. }) = methods.get("init") {
-                            let params = (**params).clone();
                             let body = body.clone();
                             if evaluated_args.len() != params.len() {
                                 return Err(PitruckError::RuntimeError {
@@ -986,6 +972,7 @@ impl Interpreter {
                     }
                     Value::BoundMethod { receiver, method } => {
                         if let Value::Function { params, body, .. } = *method {
+                            let body = body.clone();
                             if evaluated_args.len() != params.len() {
                                 return Err(PitruckError::RuntimeError {
                                     line: *line,
@@ -1011,8 +998,31 @@ impl Interpreter {
         }
     }
 
+    #[inline(always)]
     fn apply_binop(&self, op: &BinOpKind, l: Value, r: Value, line: usize) -> Result<Value, PitruckError> {
         let type_err = |msg: &str| PitruckError::RuntimeError { line, message: msg.to_string() };
+
+        if let (Value::Number(a), Value::Number(b)) = (&l, &r) {
+            let a = *a;
+            let b = *b;
+            return match op {
+                BinOpKind::Add  => Ok(Value::Number(a + b)),
+                BinOpKind::Sub  => Ok(Value::Number(a - b)),
+                BinOpKind::Mul  => Ok(Value::Number(a * b)),
+                BinOpKind::Div  => {
+                    if b == 0.0 { Err(type_err("division by zero")) }
+                    else { Ok(Value::Number(a / b)) }
+                }
+                BinOpKind::Mod  => Ok(Value::Number(a % b)),
+                BinOpKind::Eq   => Ok(Value::Bool(a == b)),
+                BinOpKind::NotEq => Ok(Value::Bool(a != b)),
+                BinOpKind::Lt   => Ok(Value::Bool(a < b)),
+                BinOpKind::Gt   => Ok(Value::Bool(a > b)),
+                BinOpKind::LtEq => Ok(Value::Bool(a <= b)),
+                BinOpKind::GtEq => Ok(Value::Bool(a >= b)),
+                BinOpKind::And | BinOpKind::Or => unreachable!(),
+            };
+        }
 
         match op {
             BinOpKind::Add => match (l, r) {
@@ -1041,30 +1051,22 @@ impl Interpreter {
             },
             BinOpKind::Eq    => Ok(Value::Bool(self.values_equal(&l, &r))),
             BinOpKind::NotEq => Ok(Value::Bool(!self.values_equal(&l, &r))),
-            BinOpKind::Lt    => self.compare_nums(l, r, line, |a, b| a < b),
-            BinOpKind::Gt    => self.compare_nums(l, r, line, |a, b| a > b),
-            BinOpKind::LtEq  => self.compare_nums(l, r, line, |a, b| a <= b),
-            BinOpKind::GtEq  => self.compare_nums(l, r, line, |a, b| a >= b),
+            BinOpKind::Lt    => Err(type_err("'<' requires numbers")),
+            BinOpKind::Gt    => Err(type_err("'>' requires numbers")),
+            BinOpKind::LtEq  => Err(type_err("'<=' requires numbers")),
+            BinOpKind::GtEq  => Err(type_err("'>=' requires numbers")),
             BinOpKind::And | BinOpKind::Or => unreachable!("And/Or short-circuit in eval_expr"),
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn values_equal(&self, l: &Value, r: &Value) -> bool {
         match (l, r) {
             (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Str(a),    Value::Str(b))    => a == b,
-            (Value::Bool(a),   Value::Bool(b))   => a == b,
-            (Value::Null,      Value::Null)      => true,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Null, Value::Null) => true,
             _ => false,
-        }
-    }
-
-    fn compare_nums<F>(&self, l: Value, r: Value, line: usize, cmp: F) -> Result<Value, PitruckError>
-    where F: Fn(f64, f64) -> bool {
-        match (l, r) {
-            (Value::Number(a), Value::Number(b)) => Ok(Value::Bool(cmp(a, b))),
-            _ => Err(PitruckError::RuntimeError { line, message: "comparison requires numbers".to_string() }),
         }
     }
 }
